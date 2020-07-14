@@ -576,6 +576,9 @@ ipmi::RspType<uint8_t,  // Device ID
               >
     ipmiAppGetDeviceId(ipmi::Context::ptr ctx)
 {
+    printf("APP hostId = %d\n", ctx->hostId);
+    std::cout.flush();
+
     int r = -1;
     Revision rev = {0};
     static struct
