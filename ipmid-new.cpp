@@ -564,7 +564,7 @@ auto executionEntry(boost::asio::yield_context yield,
 
     auto ctx =
         std::make_shared<ipmi::Context>(getSdBus(), netFn, cmd, channel, userId,
-                                        sessionId, privilege, rqSA, 20, yield);
+                                        sessionId, privilege, rqSA, hostId, yield);
     auto request = std::make_shared<ipmi::message::Request>(
         ctx, std::forward<std::vector<uint8_t>>(data));
 
