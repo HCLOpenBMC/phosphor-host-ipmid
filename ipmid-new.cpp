@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <any>
 #include <boost/algorithm/string.hpp>
+#include <boost/asio/io_context.hpp>
 #include <dcmihandler.hpp>
 #include <exception>
 #include <filesystem>
@@ -376,7 +377,7 @@ void updateOwners(sdbusplus::asio::connection& conn, const std::string& name)
         name);
 }
 
-void doListNames(boost::asio::io_service& io, sdbusplus::asio::connection& conn)
+void doListNames(boost::asio::io_context& io, sdbusplus::asio::connection& conn)
 {
     conn.async_method_call(
         [&io, &conn](const boost::system::error_code ec,
@@ -482,7 +483,7 @@ auto executionEntry(boost::asio::yield_context yield,
     std::string sender = m.get_sender();
     Privilege privilege = Privilege::None;
     int rqSA = 0;
-    int channelIdx = 0;
+    int hostIdx = 0;
     uint8_t userId = 0; // undefined user
     uint32_t sessionId = 0;
 
@@ -539,15 +540,15 @@ auto executionEntry(boost::asio::yield_context yield,
                     rqSA = std::get<int>(iter->second);
                 }
             }
-            const auto iteration = options.find("channelIdx");
+            const auto iteration = options.find("hostId");
             if (iteration != options.end())
             {
                 if (std::holds_alternative<int>(iteration->second))
                 {
-                    channelIdx = std::get<int>(iteration->second);
+                    hostIdx = std::get<int>(iteration->second);
                 }
             }
-            printf("Chn Index : %d\n", channelIdx);
+            printf("ch idx : %d\n", hostIdx);
             std::cout.flush();
         }
     }
@@ -560,9 +561,9 @@ auto executionEntry(boost::asio::yield_context yield,
                       entry("PRIVILEGE=%u", static_cast<uint8_t>(privilege)),
                       entry("RQSA=%x", rqSA));
 
-    auto ctx = std::make_shared<ipmi::Context>(getSdBus(), netFn, lun, cmd,
-                                               channel, userId, sessionId,
-                                               privilege, rqSA, channelIdx, yield);
+    auto ctx = std::make_shared<ipmi::Context>(
+        getSdBus(), netFn, lun, cmd, channel, userId, sessionId, privilege,
+        rqSA, hostIdx, yield);
     auto request = std::make_shared<ipmi::message::Request>(
         ctx, std::forward<std::vector<uint8_t>>(data));
     message::Response::ptr response = executeIpmiCommand(request);
