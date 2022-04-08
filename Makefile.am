@@ -192,7 +192,8 @@ libwhitelist_la_LDFLAGS = \
 	$(PHOSPHOR_LOGGING_LIBS) \
 	$(PHOSPHOR_DBUS_INTERFACES_LIBS) \
 	-version-info 0:0:0 -shared
-libwhitelist_la_CXXFLAGS = $(COMMON_CXX)
+libwhitelist_la_CXXFLAGS = $(COMMON_CXX) \
+                           -Dhost_instances=\"$(INSTANCES)\"
 nodist_libwhitelist_la_SOURCES = ipmiwhitelist.cpp
 endif
 
