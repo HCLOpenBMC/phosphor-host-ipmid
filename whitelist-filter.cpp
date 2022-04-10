@@ -70,7 +70,7 @@ void WhitelistFilter::cacheRestrictedMode()
     std::string restrictionModeService;
 
     std::string instances = host_instances;
-    std::string delimiter = ",";
+    std::string delimiter = " ";
     size_t pos = 0;
     std::string token;
     std::vector<int> host;
