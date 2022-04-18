@@ -18,6 +18,8 @@ namespace ipmi
 namespace
 {
 
+std::vector<int> host;
+
 /** @class WhitelistFilter
  *
  * Class that implements an IPMI message filter based
@@ -53,6 +55,21 @@ WhitelistFilter::WhitelistFilter()
     bus = getSdBus();
 
     log<level::INFO>("Loading whitelist filter");
+    
+    std::cerr << "whitelist filter constructor called .." << std::endl;
+    
+    std::string instances = host_instances;
+    std::string delimiter = " ";
+    size_t pos = 0;
+    std::string token;
+
+    while ((pos = instances.find(delimiter)) != std::string::npos)
+    {
+       token = instances.substr(0, pos);
+       host.emplace_back(std::stoi(token));
+       instances.erase(0, pos + delimiter.length());
+    }
+    host.emplace_back(std::stoi(instances));
 
     ipmi::registerFilter(ipmi::prioOpenBmcBase,
                          [this](ipmi::message::Request::ptr request) {
@@ -68,20 +85,6 @@ void WhitelistFilter::cacheRestrictedMode()
     using namespace sdbusplus::xyz::openbmc_project::Control::Security::server;
     std::string restrictionModeSetting;
     std::string restrictionModeService;
-
-    std::string instances = host_instances;
-    std::string delimiter = " ";
-    size_t pos = 0;
-    std::string token;
-    std::vector<int> host;
-
-    while ((pos = instances.find(delimiter)) != std::string::npos)
-    {
-       token = instances.substr(0, pos);
-       host.emplace_back(std::stoi(token));
-       instances.erase(0, pos + delimiter.length());
-    }
-    host.emplace_back(std::stoi(instances));
 
     for(size_t iter=0; iter<host.size(); iter++)
     {
@@ -109,6 +112,8 @@ void WhitelistFilter::cacheRestrictedMode()
        return;
        }
        auto mode = std::get<std::string>(v);
+  
+       std::cerr << " Mode : " << mode << std::endl;
        auto restrictionMode =
        RestrictionMode::convertModesFromString(mode);
        restrictedMode =
@@ -177,8 +182,16 @@ void WhitelistFilter::postInit()
 
 ipmi::Cc WhitelistFilter::filterMessage(ipmi::message::Request::ptr request)
 {
+    std::cerr << "Host Idx1 : " << request->ctx->hostIdx << std::endl;
+    std::cerr << "Netfn1 : " << request->ctx->netFn << std::endl;
+    std::cerr << "Cmd1 : " << request->ctx->cmd << std::endl;
+
     if (request->ctx->channel == ipmi::channelSystemIface && restrictedMode)
     {
+        std::cerr << "Host Idx : " << request->ctx->hostIdx << std::endl;
+        std::cerr << "Netfn : " << request->ctx->netFn << std::endl;
+        std::cerr << "Cmd : " << request->ctx->cmd << std::endl;
+
         if (!std::binary_search(
                 whitelist.cbegin(), whitelist.cend(),
                 std::make_pair(request->ctx->netFn, request->ctx->cmd)))
