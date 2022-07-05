@@ -158,6 +158,12 @@ constexpr uint16_t VLAN_ENABLE_FLAG = 0x8000;
 constexpr uint8_t MAX_IPV6_STATIC_ADDRESSES = 15;
 constexpr uint8_t MAX_IPV6_DYNAMIC_ADDRESSES = 15;
 
+// Prefix length limits of phosphor-networkd
+constexpr uint8_t MIN_IPV4_PREFIX_LENGTH = 1;
+constexpr uint8_t MAX_IPV4_PREFIX_LENGTH = 32;
+constexpr uint8_t MIN_IPV6_PREFIX_LENGTH = 1;
+constexpr uint8_t MAX_IPV6_PREFIX_LENGTH = 128;
+
 /** @brief The dbus parameters for the interface corresponding to a channel
  *         This helps reduce the number of mapper lookups we need for each
  *         query and simplifies finding the VLAN interface if needed.
@@ -469,7 +475,8 @@ ether_addr stringToMAC(const char* mac);
  */
 template <int family>
 std::optional<IfAddr<family>> findIfAddr(
-    sdbusplus::bus::bus& bus, const ChannelParams& params, uint8_t idx,
+    [[maybe_unused]] sdbusplus::bus::bus& bus,
+    [[maybe_unused]] const ChannelParams& params, uint8_t idx,
     const std::unordered_set<
         sdbusplus::xyz::openbmc_project::Network::server::IP::AddressOrigin>&
         origins,
@@ -504,7 +511,7 @@ std::optional<IfAddr<family>> findIfAddr(
         ifaddr.address = *addr;
         ifaddr.prefix = std::get<uint8_t>(properties.at("PrefixLength"));
         ifaddr.origin = origin;
-        return std::move(ifaddr);
+        return ifaddr;
     }
 
     return std::nullopt;
@@ -587,7 +594,7 @@ std::optional<typename AddrFamily<family>::addr>
 
 template <int family>
 std::optional<IfNeigh<family>>
-    findStaticNeighbor(sdbusplus::bus::bus& bus, const ChannelParams& params,
+    findStaticNeighbor(sdbusplus::bus::bus&, const ChannelParams&,
                        const typename AddrFamily<family>::addr& ip,
                        ObjectLookupCache& neighbors)
 {
@@ -617,7 +624,7 @@ std::optional<IfNeigh<family>>
         ret.ip = ip;
         const auto& macStr = std::get<std::string>(neighbor.at("MACAddress"));
         ret.mac = stringToMAC(macStr.c_str());
-        return std::move(ret);
+        return ret;
     }
 
     return std::nullopt;
@@ -677,6 +684,26 @@ void setGatewayProperty(sdbusplus::bus::bus& bus, const ChannelParams& params,
         createNeighbor<family>(bus, params, address, neighbor->mac);
     }
 }
+
+/** @enum SolConfParam
+ *
+ *  using for Set/Get SOL configuration parameters command.
+ */
+enum class SolConfParam : uint8_t
+{
+    Progress,       //!< Set In Progress.
+    Enable,         //!< SOL Enable.
+    Authentication, //!< SOL Authentication.
+    Accumulate,     //!< Character Accumulate Interval & Send Threshold.
+    Retry,          //!< SOL Retry.
+    NonVbitrate,    //!< SOL non-volatile bit rate.
+    Vbitrate,       //!< SOL volatile bit rate.
+    Channel,        //!< SOL payload channel.
+    Port,           //!< SOL payload port.
+};
+
+constexpr uint8_t ipmiCCParamNotSupported = 0x80;
+constexpr uint8_t ipmiCCWriteReadParameter = 0x82;
 
 } // namespace transport
 } // namespace ipmi

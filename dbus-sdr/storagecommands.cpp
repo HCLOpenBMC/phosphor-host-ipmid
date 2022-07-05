@@ -23,6 +23,7 @@
 #include <boost/container/flat_map.hpp>
 #include <boost/process.hpp>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <iostream>
 #include <ipmid/api.hpp>
@@ -229,9 +230,10 @@ void recalculateHashes()
     }
 }
 
-void replaceCacheFru(const std::shared_ptr<sdbusplus::asio::connection>& bus,
-                     boost::asio::yield_context& yield,
-                     const std::optional<std::string>& path = std::nullopt)
+void replaceCacheFru(
+    const std::shared_ptr<sdbusplus::asio::connection>& bus,
+    boost::asio::yield_context& yield,
+    [[maybe_unused]] const std::optional<std::string>& path = std::nullopt)
 {
     boost::system::error_code ec;
 
@@ -553,7 +555,7 @@ ipmi::RspType<uint16_t, // inventorySize
     return ipmi::responseSuccess(fruCache.size(), accessType);
 }
 
-ipmi_ret_t getFruSdrCount(ipmi::Context::ptr ctx, size_t& count)
+ipmi_ret_t getFruSdrCount(ipmi::Context::ptr, size_t& count)
 {
     count = deviceHashes.size();
     return IPMI_CC_OK;
@@ -1053,7 +1055,16 @@ ipmi::RspType<uint16_t, // Next Record ID
             sensorType = getSensorTypeFromPath(sensorPath);
             sensorAndLun = getSensorNumberFromPath(sensorPath);
             sensorNum = static_cast<uint8_t>(sensorAndLun);
-            generatorID |= sensorAndLun >> 8;
+            if ((generatorID & 0x0001) == 0)
+            {
+                // IPMB Address
+                generatorID |= sensorAndLun & 0x0300;
+            }
+            else
+            {
+                // system software
+                generatorID |= sensorAndLun >> 8;
+            }
             eventType = getSensorEventTypeFromPath(sensorPath);
 
             // Get the event direction
@@ -1083,11 +1094,17 @@ ipmi::RspType<uint16_t, // Next Record ID
     return ipmi::responseUnspecifiedError();
 }
 
-ipmi::RspType<uint16_t> ipmiStorageAddSELEntry(
-    uint16_t recordID, uint8_t recordType, uint32_t timestamp,
-    uint16_t generatorID, uint8_t evmRev, uint8_t sensorType, uint8_t sensorNum,
-    uint8_t eventType, uint8_t eventData1, uint8_t eventData2,
-    uint8_t eventData3)
+/*
+Unused arguments
+  uint16_t recordID, uint8_t recordType, uint32_t timestamp,
+  uint16_t generatorID, uint8_t evmRev, uint8_t sensorType, uint8_t sensorNum,
+  uint8_t eventType, uint8_t eventData1, uint8_t eventData2,
+  uint8_t eventData3
+*/
+ipmi::RspType<uint16_t> ipmiStorageAddSELEntry(uint16_t, uint8_t, uint32_t,
+                                               uint16_t, uint8_t, uint8_t,
+                                               uint8_t, uint8_t, uint8_t,
+                                               uint8_t, uint8_t)
 {
     // Per the IPMI spec, need to cancel any reservation when a SEL entry is
     // added
@@ -1097,7 +1114,7 @@ ipmi::RspType<uint16_t> ipmiStorageAddSELEntry(
     return ipmi::responseSuccess(responseID);
 }
 
-ipmi::RspType<uint8_t> ipmiStorageClearSEL(ipmi::Context::ptr ctx,
+ipmi::RspType<uint8_t> ipmiStorageClearSEL(ipmi::Context::ptr,
                                            uint16_t reservationID,
                                            const std::array<uint8_t, 3>& clr,
                                            uint8_t eraseOperation)
@@ -1188,7 +1205,7 @@ ipmi::RspType<uint32_t> ipmiStorageGetSELTime()
     return ipmi::responseSuccess(selTime.tv_sec);
 }
 
-ipmi::RspType<> ipmiStorageSetSELTime(uint32_t selTime)
+ipmi::RspType<> ipmiStorageSetSELTime(uint32_t)
 {
     // Set SEL Time is not supported
     return ipmi::responseInvalidCommand();
@@ -1234,45 +1251,15 @@ std::vector<uint8_t> getType12SDRs(uint16_t index, uint16_t recordId)
     std::vector<uint8_t> resp;
     if (index == 0)
     {
-        Type12Record bmc = {};
-        bmc.header.record_id_lsb = recordId;
-        bmc.header.record_id_msb = recordId >> 8;
-        bmc.header.sdr_version = ipmiSdrVersion;
-        bmc.header.record_type = 0x12;
-        bmc.header.record_length = 0x1b;
-        bmc.slaveAddress = 0x20;
-        bmc.channelNumber = 0;
-        bmc.powerStateNotification = 0;
-        bmc.deviceCapabilities = 0xBF;
-        bmc.reserved = 0;
-        bmc.entityID = 0x2E;
-        bmc.entityInstance = 1;
-        bmc.oem = 0;
-        bmc.typeLengthCode = 0xD0;
         std::string bmcName = "Basbrd Mgmt Ctlr";
-        std::copy(bmcName.begin(), bmcName.end(), bmc.name);
+        Type12Record bmc(recordId, 0x20, 0, 0, 0xbf, 0x2e, 1, 0, bmcName);
         uint8_t* bmcPtr = reinterpret_cast<uint8_t*>(&bmc);
         resp.insert(resp.end(), bmcPtr, bmcPtr + sizeof(Type12Record));
     }
     else if (index == 1)
     {
-        Type12Record me = {};
-        me.header.record_id_lsb = recordId;
-        me.header.record_id_msb = recordId >> 8;
-        me.header.sdr_version = ipmiSdrVersion;
-        me.header.record_type = 0x12;
-        me.header.record_length = 0x16;
-        me.slaveAddress = 0x2C;
-        me.channelNumber = 6;
-        me.powerStateNotification = 0x24;
-        me.deviceCapabilities = 0x21;
-        me.reserved = 0;
-        me.entityID = 0x2E;
-        me.entityInstance = 2;
-        me.oem = 0;
-        me.typeLengthCode = 0xCB;
         std::string meName = "Mgmt Engine";
-        std::copy(meName.begin(), meName.end(), me.name);
+        Type12Record me(recordId, 0x2c, 6, 0x24, 0x21, 0x2e, 2, 0, meName);
         uint8_t* mePtr = reinterpret_cast<uint8_t*>(&me);
         resp.insert(resp.end(), mePtr, mePtr + sizeof(Type12Record));
     }

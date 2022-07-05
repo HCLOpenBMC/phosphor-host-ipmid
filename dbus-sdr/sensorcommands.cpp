@@ -115,7 +115,7 @@ static sdbusplus::bus::match::match sensorAdded(
     *getSdBus(),
     "type='signal',member='InterfacesAdded',arg0path='/xyz/openbmc_project/"
     "sensors/'",
-    [](sdbusplus::message::message& m) {
+    [](sdbusplus::message::message&) {
         getSensorTree().clear();
         sdrLastAdd = std::chrono::duration_cast<std::chrono::seconds>(
                          std::chrono::system_clock::now().time_since_epoch())
@@ -126,7 +126,7 @@ static sdbusplus::bus::match::match sensorRemoved(
     *getSdBus(),
     "type='signal',member='InterfacesRemoved',arg0path='/xyz/openbmc_project/"
     "sensors/'",
-    [](sdbusplus::message::message& m) {
+    [](sdbusplus::message::message&) {
         getSensorTree().clear();
         sdrLastRemove = std::chrono::duration_cast<std::chrono::seconds>(
                             std::chrono::system_clock::now().time_since_epoch())
@@ -474,10 +474,10 @@ bool getVrEventStatus(ipmi::Context::ptr ctx, const std::string& connection,
     {
         return false;
     }
-    ipmi::Value modeVariant;
+    std::string mode;
 
     auto ec = getDbusProperty(ctx, connection, path, sensor::vrInterface,
-                              "Selected", modeVariant);
+                              "Selected", mode);
     if (ec)
     {
         log<level::ERR>("Failed to get property",
@@ -488,17 +488,7 @@ bool getVrEventStatus(ipmi::Context::ptr ctx, const std::string& connection,
         return false;
     }
 
-    auto mode = std::get_if<std::string>(&modeVariant);
-    if (mode == nullptr)
-    {
-        log<level::ERR>("property is not a string",
-                        entry("PROPERTY=%s", "Selected"),
-                        entry("PATH=%s", path.c_str()),
-                        entry("INTERFACE=%s", sensor::sensorInterface));
-        return false;
-    }
-
-    auto itr = std::find(profiles->begin(), profiles->end(), *mode);
+    auto itr = std::find(profiles->begin(), profiles->end(), mode);
     if (itr == profiles->end())
     {
         using namespace phosphor::logging;
@@ -528,7 +518,7 @@ bool getVrEventStatus(ipmi::Context::ptr ctx, const std::string& connection,
     if constexpr (debug)
     {
         std::cerr << "VR sensor " << sensor::parseSdrIdFromPath(path)
-                  << " mode is: [" << index << "] " << *mode << std::endl;
+                  << " mode is: [" << index << "] " << mode << std::endl;
     }
     return true;
 }
@@ -541,7 +531,7 @@ ipmi::RspType<> ipmiSenPlatformEvent(ipmi::Context::ptr ctx,
     constexpr const uint8_t lastSensorType = 0x2C;
     constexpr const uint8_t oemReserved = 0xC0;
 
-    uint8_t generatorID = 0;
+    uint8_t sysgeneratorID = 0;
     uint8_t evmRev = 0;
     uint8_t sensorType = 0;
     uint8_t sensorNum = 0;
@@ -549,6 +539,7 @@ ipmi::RspType<> ipmiSenPlatformEvent(ipmi::Context::ptr ctx,
     uint8_t eventData1 = 0;
     std::optional<uint8_t> eventData2 = 0;
     std::optional<uint8_t> eventData3 = 0;
+    [[maybe_unused]] uint16_t generatorID = 0;
     ipmi::ChannelInfo chInfo;
 
     if (ipmi::getChannelInfo(ctx->channel, chInfo) != ipmi::ccSuccess)
@@ -563,15 +554,24 @@ ipmi::RspType<> ipmiSenPlatformEvent(ipmi::Context::ptr ctx,
         ipmi::EChannelMediumType::systemInterface)
     {
 
-        p.unpack(generatorID, evmRev, sensorType, sensorNum, eventType,
+        p.unpack(sysgeneratorID, evmRev, sensorType, sensorNum, eventType,
                  eventData1, eventData2, eventData3);
+        // Refer to IPMI Spec Table 32: SEL Event Records
+        generatorID = (ctx->channel << 12) // Channel
+                      | (0x0 << 10)        // Reserved
+                      | (0x0 << 8)         // 0x0 for sys-soft ID
+                      | ((sysgeneratorID << 1) | 0x1);
     }
     else
     {
 
         p.unpack(evmRev, sensorType, sensorNum, eventType, eventData1,
                  eventData2, eventData3);
-        generatorID = ctx->rqSA;
+        // Refer to IPMI Spec Table 32: SEL Event Records
+        generatorID = (ctx->channel << 12)      // Channel
+                      | (0x0 << 10)             // Reserved
+                      | ((ctx->lun & 0x3) << 8) // Lun
+                      | (ctx->rqSA << 1);
     }
 
     if (!p.fullyUnpacked())
@@ -593,11 +593,10 @@ ipmi::RspType<> ipmiSenPlatformEvent(ipmi::Context::ptr ctx,
 }
 
 ipmi::RspType<> ipmiSetSensorReading(ipmi::Context::ptr ctx,
-                                     uint8_t sensorNumber, uint8_t operation,
+                                     uint8_t sensorNumber, uint8_t,
                                      uint8_t reading, uint15_t assertOffset,
-                                     bool resvd1, uint15_t deassertOffset,
-                                     bool resvd2, uint8_t eventData1,
-                                     uint8_t eventData2, uint8_t eventData3)
+                                     bool, uint15_t, bool, uint8_t, uint8_t,
+                                     uint8_t)
 {
     std::string connection;
     std::string path;
@@ -626,7 +625,8 @@ ipmi::RspType<> ipmiSetSensorReading(ipmi::Context::ptr ctx,
         }
 
         // Only allow external SetSensor if write permission granted
-        if (!details::sdrWriteTable.getWritePermission(sensorNumber))
+        if (!details::sdrWriteTable.getWritePermission((ctx->lun << 8) |
+                                                       sensorNumber))
         {
             return ipmi::responseResponseError();
         }
@@ -853,12 +853,14 @@ ipmi::RspType<uint8_t, uint8_t, uint8_t, std::optional<uint8_t>>
         }
 
         // Keep stats on the reading just obtained, even if it is "NaN"
-        if (details::sdrStatsTable.updateReading(sensnum, reading, byteValue))
+        if (details::sdrStatsTable.updateReading((ctx->lun << 8) | sensnum,
+                                                 reading, byteValue))
         {
             // This is the first reading, show the coefficients
             double step = (max - min) / 255.0;
             std::cerr << "IPMI sensor "
-                      << details::sdrStatsTable.getName(sensnum)
+                      << details::sdrStatsTable.getName((ctx->lun << 8) |
+                                                        sensnum)
                       << ": Range min=" << min << " max=" << max
                       << ", step=" << step
                       << ", Coefficients mValue=" << static_cast<int>(mValue)
@@ -946,9 +948,9 @@ ipmi::RspType<> ipmiSenSetSensorThresholds(
     bool lowerCriticalThreshMask, bool lowerNonRecovThreshMask,
     bool upperNonCriticalThreshMask, bool upperCriticalThreshMask,
     bool upperNonRecovThreshMask, uint2_t reserved, uint8_t lowerNonCritical,
-    uint8_t lowerCritical, uint8_t lowerNonRecoverable,
+    uint8_t lowerCritical, [[maybe_unused]] uint8_t lowerNonRecoverable,
     uint8_t upperNonCritical, uint8_t upperCritical,
-    uint8_t upperNonRecoverable)
+    [[maybe_unused]] uint8_t upperNonRecoverable)
 {
     if (sensorNum == reservedSensorNumber || reserved)
     {
@@ -1598,7 +1600,6 @@ bool constructSensorSdr(ipmi::Context::ptr ctx, uint16_t sensorNum,
                         const std::string& path,
                         get_sdr::SensorDataFullRecord& record)
 {
-    uint8_t sensornumber = static_cast<uint8_t>(sensorNum);
     constructSensorSdrHeaderKey(sensorNum, recordID, record);
 
     DbusInterfaceMap sensorMap;
@@ -1716,7 +1717,7 @@ bool constructSensorSdr(ipmi::Context::ptr ctx, uint16_t sensorNum,
                  sizeof(record.body.id_string));
 
     // Remember the sensor name, as determined for this sensor number
-    details::sdrStatsTable.updateName(sensornumber, name);
+    details::sdrStatsTable.updateName(sensorNum, name);
 
     bool sensorSettable = false;
     auto mutability =
@@ -1729,7 +1730,7 @@ bool constructSensorSdr(ipmi::Context::ptr ctx, uint16_t sensorNum,
     get_sdr::body::init_settable_state(sensorSettable, &record.body);
 
     // Grant write permission to sensors deemed externally settable
-    details::sdrWriteTable.setWritePermission(sensornumber, sensorSettable);
+    details::sdrWriteTable.setWritePermission(sensorNum, sensorSettable);
 
     IPMIThresholds thresholdData;
     try
@@ -1800,7 +1801,7 @@ bool constructSensorSdr(ipmi::Context::ptr ctx, uint16_t sensorNum,
 
 #ifdef FEATURE_HYBRID_SENSORS
 // Construct a type 1 SDR for discrete Sensor typed sensor.
-void constructStaticSensorSdr(ipmi::Context::ptr ctx, uint16_t sensorNum,
+void constructStaticSensorSdr(ipmi::Context::ptr, uint16_t sensorNum,
                               uint16_t recordID,
                               ipmi::sensor::IdInfoMap::const_iterator sensor,
                               get_sdr::SensorDataFullRecord& record)
@@ -1866,7 +1867,6 @@ bool constructVrSdr(ipmi::Context::ptr ctx, uint16_t sensorNum,
                     const std::string& path,
                     get_sdr::SensorDataEventRecord& record)
 {
-    uint8_t sensornumber = static_cast<uint8_t>(sensorNum);
     constructEventSdrHeaderKey(sensorNum, recordID, record);
 
     DbusInterfaceMap sensorMap;
@@ -1902,7 +1902,7 @@ bool constructVrSdr(ipmi::Context::ptr ctx, uint16_t sensorNum,
     std::memcpy(record.body.id_string, name.c_str(), nameSize);
 
     // Remember the sensor name, as determined for this sensor number
-    details::sdrStatsTable.updateName(sensornumber, name);
+    details::sdrStatsTable.updateName(sensorNum, name);
 
     return true;
 }
@@ -2049,7 +2049,7 @@ static int
     if (std::find(interfaces.begin(), interfaces.end(),
                   sensor::sensorInterface) != interfaces.end())
     {
-        get_sdr::SensorDataFullRecord record = {0};
+        get_sdr::SensorDataFullRecord record = {};
 
         // If the request doesn't read SDR body, construct only header and key
         // part to avoid additional DBus transaction.
@@ -2075,7 +2075,7 @@ static int
         getSensorEventTypeFromPath(path) !=
             static_cast<uint8_t>(SensorEventTypeCodes::threshold))
     {
-        get_sdr::SensorDataFullRecord record = {0};
+        get_sdr::SensorDataFullRecord record = {};
 
         // If the request doesn't read SDR body, construct only header and key
         // part to avoid additional DBus transaction.
@@ -2099,7 +2099,7 @@ static int
     if (std::find(interfaces.begin(), interfaces.end(), sensor::vrInterface) !=
         interfaces.end())
     {
-        get_sdr::SensorDataEventRecord record = {0};
+        get_sdr::SensorDataEventRecord record = {};
 
         // If the request doesn't read SDR body, construct only header and key
         // part to avoid additional DBus transaction.
