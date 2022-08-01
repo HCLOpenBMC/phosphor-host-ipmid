@@ -1,5 +1,5 @@
 project(
-  'phosphor-host-ipimd',
+  'phosphor-host-ipmid',
   'cpp',
   version: '0.1',
   meson_version: '>=0.57.0',
@@ -89,8 +89,16 @@ crypto = dependency('libcrypto', version : '>=1.0.2g')
 pam = cpp.find_library('pam', required: true)
 mapper = dependency('libmapper')
 boost_coroutine = cpp.find_library('boost_coroutine', required: true)
-std_cpp_fs = cpp.find_library('stdc++fs', required: true)
 sdbusplus_dep = dependency('sdbusplus')
+
+if cpp.has_header_symbol(
+        'nlohmann/json.hpp',
+        'nlohmann::json::string_t',
+        required:false)
+    nlohmann_json_dep = declare_dependency()
+else
+    nlohmann_json_dep = dependency('nlohmann-json')
+endif
 
 # Subfolders
 subdir('libipmid')
@@ -171,7 +179,6 @@ ipmid_pre = [
   ipmid_dep,
   channellayer_dep,
   mapper,
-  std_cpp_fs
 ]
 
 generated_src = [
@@ -189,7 +196,7 @@ entity_map_json_lib = static_library(
   'entity_map_json',
   'entity_map_json.cpp',
   include_directories: root_inc,
-  dependencies: [ipmid_dep],
+  dependencies: [ipmid_dep, nlohmann_json_dep],
   implicit_include_directories: false)
 
 entity_map_json_dep = declare_dependency(link_with: entity_map_json_lib)
@@ -213,6 +220,7 @@ libipmi20_src = [
   'ipmi_fru_info_area.cpp',
   'read_fru_data.cpp',
   'sensordatahandler.cpp',
+  'user_channel/channelcommands.cpp',
   generated_src,
   transportoem_src,
   conf_h,
@@ -221,7 +229,7 @@ libipmi20_src = [
 ipmi20_lib = library(
   'ipmi20',
   libipmi20_src,
-  dependencies: [ipmid_pre, entity_map_json_dep],
+  dependencies: [ipmid_pre, entity_map_json_dep, nlohmann_json_dep],
   include_directories: root_inc,
   install: true,
   install_dir: get_option('libdir') / 'ipmid-providers',
