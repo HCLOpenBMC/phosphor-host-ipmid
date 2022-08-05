@@ -14,11 +14,12 @@ using namespace sdbusplus::xyz::openbmc_project::Common::Error;
 namespace ipmi
 {
 
+int hostIdx;
+constexpr int ARRAY_SIZE = 20;
+
 // put the filter provider in an unnamed namespace
 namespace
 {
-
-std::vector<int> host;
 
 /** @class WhitelistFilter
  *
@@ -41,7 +42,7 @@ class WhitelistFilter
     void handleRestrictedModeChange(sdbusplus::message::message& m);
     ipmi::Cc filterMessage(ipmi::message::Request::ptr request);
 
-    bool restrictedMode = true;
+    bool restrictedMode[ARRAY_SIZE] = {true};
     std::shared_ptr<sdbusplus::asio::connection> bus;
     std::unique_ptr<settings::Objects> objects;
     std::unique_ptr<sdbusplus::bus::match::match> modeChangeMatch;
@@ -54,23 +55,7 @@ WhitelistFilter::WhitelistFilter()
 {
     bus = getSdBus();
 
-    log<level::INFO>("Loading whitelist filter");
-    
-    std::cerr << "whitelist filter constructor called .." << std::endl;
-    
-    std::string instances = host_instances;
-    std::string delimiter = " ";
-    size_t pos = 0;
-    std::string token;
-
-    while ((pos = instances.find(delimiter)) != std::string::npos)
-    {
-       token = instances.substr(0, pos);
-       host.emplace_back(std::stoi(token));
-       instances.erase(0, pos + delimiter.length());
-    }
-    host.emplace_back(std::stoi(instances));
-
+    log<level::INFO>("Loading whitelist filter"); 
     ipmi::registerFilter(ipmi::prioOpenBmcBase,
                          [this](ipmi::message::Request::ptr request) {
                              return filterMessage(request);
@@ -85,46 +70,41 @@ void WhitelistFilter::cacheRestrictedMode()
     using namespace sdbusplus::xyz::openbmc_project::Control::Security::server;
     std::string restrictionModeSetting;
     std::string restrictionModeService;
+ 
+    try
+    { 
+         restrictionModeSetting = objects->map.at(restrictionModeIntf).at(hostIdx);
+	 restrictionModeService =
+		    objects->service(restrictionModeSetting, restrictionModeIntf);
 
-    for(size_t iter=0; iter<host.size(); iter++)
-    {
-       try
-       {
-          restrictionModeSetting = objects->map.at(restrictionModeIntf).at(iter);
-          restrictionModeService =
-          objects->service(restrictionModeSetting, restrictionModeIntf);
-
-       }
-       catch (const std::out_of_range& e)
-       {
-          log<level::ERR>(
-            "Could not look up restriction mode interface from cache");
-          return;
-       }
-
-       bus->async_method_call(
-       [this](boost::system::error_code ec, ipmi::Value v) {
-       if (ec)
-       {
-       log<level::ERR>("Error in RestrictionMode Get");
-       // Fail-safe to true.
-       restrictedMode = true;
-       return;
-       }
-       auto mode = std::get<std::string>(v);
-  
-       std::cerr << " Mode : " << mode << std::endl;
-       auto restrictionMode =
-       RestrictionMode::convertModesFromString(mode);
-       restrictedMode =
-       (restrictionMode == RestrictionMode::Modes::Whitelist);
-       log<level::INFO>((restrictedMode ? "Set restrictedMode = true"
-       : "Set restrictedMode = false"));
-       },
-       restrictionModeService, restrictionModeSetting,
-       "org.freedesktop.DBus.Properties", "Get", restrictionModeIntf,
-       "RestrictionMode");
     }
+    catch (const std::out_of_range& e)
+    {
+	 log<level::ERR>("Could not look up restriction mode interface from cache");
+	 return;
+    }
+
+    bus->async_method_call(
+    [this](boost::system::error_code ec, ipmi::Value v) {
+    if (ec)
+    {
+      log<level::ERR>("Error in RestrictionMode Get");
+      // Fail-safe to true.
+      restrictedMode[hostIdx] = true;
+      return;
+    }
+
+    auto mode = std::get<std::string>(v);
+    auto restrictionMode =
+    RestrictionMode::convertModesFromString(mode);
+    restrictedMode[hostIdx] =
+    (restrictionMode == RestrictionMode::Modes::Whitelist);
+    log<level::INFO>((restrictedMode[hostIdx] ? "Set restrictedMode = true"
+			    : "Set restrictedMode = false"));
+    },
+    restrictionModeService, restrictionModeSetting,
+    "org.freedesktop.DBus.Properties", "Get", restrictionModeIntf,
+    "RestrictionMode");
 }
 
 void WhitelistFilter::handleRestrictedModeChange(sdbusplus::message::message& m)
@@ -140,9 +120,9 @@ void WhitelistFilter::handleRestrictedModeChange(sdbusplus::message::message& m)
             RestrictionMode::Modes restrictionMode =
                 RestrictionMode::convertModesFromString(
                     std::get<std::string>(property.second));
-            restrictedMode =
+            restrictedMode[hostIdx] =
                 (restrictionMode == RestrictionMode::Modes::Whitelist);
-            log<level::INFO>((restrictedMode
+            log<level::INFO>((restrictedMode[hostIdx]
                                   ? "Updated restrictedMode = true"
                                   : "Updated restrictedMode = false"));
         }
@@ -166,8 +146,8 @@ void WhitelistFilter::postInit()
     std::string filterStr;
     try
     {
-        filterStr = sdbusplus::bus::match::rules::propertiesChanged(
-            objects->map.at(restrictionModeIntf).at(0), restrictionModeIntf);
+           filterStr = sdbusplus::bus::match::rules::propertiesChanged(
+            objects->map.at(restrictionModeIntf).at(hostIdx), restrictionModeIntf);
     }
     catch (const std::out_of_range& e)
     {
@@ -182,16 +162,14 @@ void WhitelistFilter::postInit()
 
 ipmi::Cc WhitelistFilter::filterMessage(ipmi::message::Request::ptr request)
 {
-    std::cerr << "Host Idx1 : " << request->ctx->hostIdx << std::endl;
-    std::cerr << "Netfn1 : " << request->ctx->netFn << std::endl;
-    std::cerr << "Cmd1 : " << request->ctx->cmd << std::endl;
+     /* Getting hostIdx for all IPMI devices like hosts, debugcard and other
+    devices from ipmi::message::Request and call postInit() to get the
+    restriction mode for all the IPMI commands */
 
-    if (request->ctx->channel == ipmi::channelSystemIface && restrictedMode)
+    hostIdx = request->ctx->hostIdx;
+
+    if (request->ctx->channel == ipmi::channelSystemIface && restrictedMode[hostIdx])
     {
-        std::cerr << "Host Idx : " << request->ctx->hostIdx << std::endl;
-        std::cerr << "Netfn : " << request->ctx->netFn << std::endl;
-        std::cerr << "Cmd : " << request->ctx->cmd << std::endl;
-
         if (!std::binary_search(
                 whitelist.cbegin(), whitelist.cend(),
                 std::make_pair(request->ctx->netFn, request->ctx->cmd)))
