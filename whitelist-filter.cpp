@@ -14,9 +14,6 @@ using namespace sdbusplus::xyz::openbmc_project::Common::Error;
 namespace ipmi
 {
 
-int hostIdx;
-constexpr int ARRAY_SIZE = 20;
-
 // put the filter provider in an unnamed namespace
 namespace
 {
@@ -42,7 +39,8 @@ class WhitelistFilter
     void handleRestrictedModeChange(sdbusplus::message::message& m);
     ipmi::Cc filterMessage(ipmi::message::Request::ptr request);
 
-    bool restrictedMode[ARRAY_SIZE] = {true};
+    std::map<int, bool> restrictedMode;
+    int hostIdx;
     std::shared_ptr<sdbusplus::asio::connection> bus;
     std::unique_ptr<settings::Objects> objects;
     std::unique_ptr<sdbusplus::bus::match::match> modeChangeMatch;
@@ -99,6 +97,9 @@ void WhitelistFilter::cacheRestrictedMode()
     RestrictionMode::convertModesFromString(mode);
     restrictedMode[hostIdx] =
     (restrictionMode == RestrictionMode::Modes::Whitelist);
+
+    std::cerr << "mode : " << restrictedMode[hostIdx] <<std::endl;
+
     log<level::INFO>((restrictedMode[hostIdx] ? "Set restrictedMode = true"
 			    : "Set restrictedMode = false"));
     },
