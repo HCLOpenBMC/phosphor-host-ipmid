@@ -39,8 +39,15 @@ class WhitelistFilter
     void handleRestrictedModeChange(sdbusplus::message::message& m);
     ipmi::Cc filterMessage(ipmi::message::Request::ptr request);
 
-    std::map<int, bool> restrictedMode;
-    int hostIdx;
+    /* hostIdx is a new data member is added to have the host Index details
+       which is needed to store restriction mode of all the hosts.
+
+       Also, bool restrictedMode type changed to vector of restrictedMode
+       which is needed to store restriction mode of all the hosts. */
+
+    std::vector<bool> restrictedMode;
+    size_t hostIdx = 0;
+
     std::shared_ptr<sdbusplus::asio::connection> bus;
     std::unique_ptr<settings::Objects> objects;
     std::unique_ptr<sdbusplus::bus::match::match> modeChangeMatch;
@@ -95,10 +102,8 @@ void WhitelistFilter::cacheRestrictedMode()
     auto mode = std::get<std::string>(v);
     auto restrictionMode =
     RestrictionMode::convertModesFromString(mode);
-    restrictedMode[hostIdx] =
-    (restrictionMode == RestrictionMode::Modes::Whitelist);
 
-    std::cerr << "mode : " << restrictedMode[hostIdx] <<std::endl;
+    restrictedMode.insert((restrictedMode.begin() + hostIdx), (restrictionMode == RestrictionMode::Modes::Whitelist));
 
     log<level::INFO>((restrictedMode[hostIdx] ? "Set restrictedMode = true"
 			    : "Set restrictedMode = false"));
@@ -121,8 +126,7 @@ void WhitelistFilter::handleRestrictedModeChange(sdbusplus::message::message& m)
             RestrictionMode::Modes restrictionMode =
                 RestrictionMode::convertModesFromString(
                     std::get<std::string>(property.second));
-            restrictedMode[hostIdx] =
-                (restrictionMode == RestrictionMode::Modes::Whitelist);
+            restrictedMode.insert((restrictedMode.begin() + hostIdx), (restrictionMode == RestrictionMode::Modes::Whitelist));
             log<level::INFO>((restrictedMode[hostIdx]
                                   ? "Updated restrictedMode = true"
                                   : "Updated restrictedMode = false"));
