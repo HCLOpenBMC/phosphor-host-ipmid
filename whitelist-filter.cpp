@@ -83,13 +83,13 @@ void WhitelistFilter::cacheRestrictedMode(const std::vector<std::string>& device
 	 return;
     }
     
-    index++;
     bus->async_method_call(
     [this, index](boost::system::error_code ec, ipmi::Value v) {
     if (ec)
     {
       log<level::ERR>("Error in RestrictionMode Get");
       // Fail-safe to true.
+      index = std::distance(std::begin(devices), &dev);
       restrictedMode[index] = true;
       return;
     }
@@ -175,9 +175,9 @@ void WhitelistFilter::postInit()
     const std::string devicesDbusPath{"/xyz/openbmc_project/control"};
     std::map<std::string, size_t> deviceList;
 
-    for(size_t index = 0; auto& dev : devices)
+    for(size_t index=0; index<devices.size(); index++)
     {
-        deviceList.insert({dev, ++index});
+        deviceList.insert({devices.at(index), index});
     }
 
     try
