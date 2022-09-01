@@ -35,8 +35,8 @@ class WhitelistFilter
 
   private:
     void postInit();
-    void cacheRestrictedMode(std::vector<std::string>& devices);
-    void handleRestrictedModeChange(sdbusplus::message::message& m, std::map<std::string, size_t> deviceList);
+    void cacheRestrictedMode(const std::vector<std::string>& devices);
+    void handleRestrictedModeChange(sdbusplus::message::message& m, const std::map<std::string, size_t>& deviceList);
     ipmi::Cc filterMessage(ipmi::message::Request::ptr request);
 
     std::vector<bool> restrictedMode;
@@ -62,17 +62,17 @@ WhitelistFilter::WhitelistFilter()
     post_work([this]() { postInit(); });
 }
 
-void WhitelistFilter::cacheRestrictedMode(std::vector<std::string>& devices)
+void WhitelistFilter::cacheRestrictedMode(const std::vector<std::string>& devices)
 {
     using namespace sdbusplus::xyz::openbmc_project::Control::Security::server;
     std::string restrictionModeSetting;
     std::string restrictionModeService;
  
-    for(uint8_t iter=0; iter<devices.size(); iter++)
+    for(size_t index = 0; auto& dev : devices)
     {
     try
     { 
-         restrictionModeSetting = devices.at(iter);
+         restrictionModeSetting = dev;
 	 restrictionModeService =
 		    objects->service(restrictionModeSetting, restrictionModeIntf);
 
@@ -82,14 +82,15 @@ void WhitelistFilter::cacheRestrictedMode(std::vector<std::string>& devices)
 	 log<level::ERR>("Could not look up restriction mode interface from cache");
 	 return;
     }
-
+    
+    index++;
     bus->async_method_call(
-    [this, iter](boost::system::error_code ec, ipmi::Value v) {
+    [this, index](boost::system::error_code ec, ipmi::Value v) {
     if (ec)
     {
       log<level::ERR>("Error in RestrictionMode Get");
       // Fail-safe to true.
-      restrictedMode[iter] = true;
+      restrictedMode[index] = true;
       return;
     }
 
@@ -109,7 +110,7 @@ void WhitelistFilter::cacheRestrictedMode(std::vector<std::string>& devices)
     }
 }
 
-void WhitelistFilter::handleRestrictedModeChange(sdbusplus::message::message& m, std::map<std::string, size_t> deviceList)
+void WhitelistFilter::handleRestrictedModeChange(sdbusplus::message::message& m, const std::map<std::string, size_t>& deviceList)
 {
     using namespace sdbusplus::xyz::openbmc_project::Control::Security::server;
     std::string intf;
@@ -174,23 +175,23 @@ void WhitelistFilter::postInit()
     const std::string devicesDbusPath{"/xyz/openbmc_project/control"};
     std::map<std::string, size_t> deviceList;
 
-    for(size_t iter=0; iter<devices.size(); iter++)
+    for(size_t index = 0; auto& dev : devices)
     {
+        deviceList.insert({dev, ++index});
+    }
+
     try
     {
         filterStr = sdbusplus::bus::match::rules::propertiesChangedNamespace(
               devicesDbusPath, restrictionModeIntf);
 
-        deviceList.insert({devices.at(iter), iter});
     }
     catch (const std::out_of_range& e)
     {
         log<level::ERR>("Failed to determine restriction mode filter string");
         return;
     }
- 
-    }
- 
+  
     modeChangeMatch = std::make_unique<sdbusplus::bus::match::match>(
         *bus, filterStr, [this, deviceList](sdbusplus::message::message& m) {
             handleRestrictedModeChange(m , deviceList);
