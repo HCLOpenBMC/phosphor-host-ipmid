@@ -84,7 +84,7 @@ void WhitelistFilter::cacheRestrictedMode(const std::vector<std::string>& device
     }
     
     bus->async_method_call(
-    [this, index = std:distance(devices.begin(), &dev)](boost::system::error_code ec, ipmi::Value v) {
+    [this, index = std::distance(devices.begin(), devices.end())](boost::system::error_code ec, ipmi::Value v) {
     if (ec)
     {
       log<level::ERR>("Error in RestrictionMode Get");
