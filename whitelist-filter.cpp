@@ -68,7 +68,7 @@ void WhitelistFilter::cacheRestrictedMode(const std::vector<std::string>& device
     std::string restrictionModeSetting;
     std::string restrictionModeService;
  
-    for(size_t index = 0; auto& dev : devices)
+    for(auto& dev : devices)
     {
     try
     { 
@@ -84,12 +84,11 @@ void WhitelistFilter::cacheRestrictedMode(const std::vector<std::string>& device
     }
     
     bus->async_method_call(
-    [this, &index, devices](boost::system::error_code ec, ipmi::Value v) {
+    [this, index = std:distance(devices.begin(), &dev)](boost::system::error_code ec, ipmi::Value v) {
     if (ec)
     {
       log<level::ERR>("Error in RestrictionMode Get");
       // Fail-safe to true.
-      index = std::distance(devices.begin(), devices.end());
       restrictedMode[index] = true;
       return;
     }
@@ -177,7 +176,7 @@ void WhitelistFilter::postInit()
 
     for(size_t index=0; index<devices.size(); index++)
     {
-        deviceList.insert({devices.at(index), index});
+        deviceList.emplace(devices[index], index);
     }
 
     filterStr = sdbusplus::bus::match::rules::propertiesChangedNamespace(
