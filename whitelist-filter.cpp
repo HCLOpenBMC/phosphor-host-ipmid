@@ -180,18 +180,9 @@ void WhitelistFilter::postInit()
         deviceList.insert({devices.at(index), index});
     }
 
-    try
-    {
-        filterStr = sdbusplus::bus::match::rules::propertiesChangedNamespace(
-              devicesDbusPath, restrictionModeIntf);
-
-    }
-    catch (const std::out_of_range& e)
-    {
-        log<level::ERR>("Failed to determine restriction mode filter string");
-        return;
-    }
-  
+    filterStr = sdbusplus::bus::match::rules::propertiesChangedNamespace(
+		    devicesDbusPath, restrictionModeIntf);
+ 
     modeChangeMatch = std::make_unique<sdbusplus::bus::match::match>(
         *bus, filterStr, [this, deviceList](sdbusplus::message::message& m) {
             handleRestrictedModeChange(m , deviceList);
