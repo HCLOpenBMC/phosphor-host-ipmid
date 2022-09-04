@@ -42,7 +42,7 @@ class WhitelistFilter
     std::vector<bool> restrictedMode;
     std::shared_ptr<sdbusplus::asio::connection> bus;
     std::unique_ptr<settings::Objects> objects;
-    std::unique_ptr<sdbusplus::bus::match::match> modeChangeMatch;
+    std::unique_ptr<sdbusplus::bus::match_t> modeChangeMatch;
 
     static constexpr const char restrictionModeIntf[] =
         "xyz.openbmc_project.Control.Security.RestrictionMode";
@@ -84,7 +84,7 @@ void WhitelistFilter::cacheRestrictedMode(const std::vector<std::string>& device
     }
     
     bus->async_method_call(
-    [this, index = std::distance(devices.begin(), devices.end())](boost::system::error_code ec, ipmi::Value v) {
+    [this, index = std::distance(&*std::begin(devices), &dev)](boost::system::error_code ec, ipmi::Value v) {
     if (ec)
     {
       log<level::ERR>("Error in RestrictionMode Get");
@@ -182,8 +182,8 @@ void WhitelistFilter::postInit()
     filterStr = sdbusplus::bus::match::rules::propertiesChangedNamespace(
 		    devicesDbusPath, restrictionModeIntf);
  
-    modeChangeMatch = std::make_unique<sdbusplus::bus::match::match>(
-        *bus, filterStr, [this, deviceList](sdbusplus::message::message& m) {
+    modeChangeMatch = std::make_unique<sdbusplus::bus::match_t>(
+        *bus, filterStr, [this, deviceList](sdbusplus::message_t& m) {
             handleRestrictedModeChange(m , deviceList);
         });
 }
