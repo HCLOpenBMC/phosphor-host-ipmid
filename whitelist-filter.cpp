@@ -62,6 +62,11 @@ WhitelistFilter::WhitelistFilter()
     post_work([this]() { postInit(); });
 }
 
+/** @brief Get RestrictionMode of the devices which has RestrictionMode support enabled
+ *  @param[in] devices - vector of devices object path 
+ *  @returns void.
+ */
+
 void WhitelistFilter::cacheRestrictedMode(const std::vector<std::string>& devices)
 {
     using namespace sdbusplus::xyz::openbmc_project::Control::Security::server;
@@ -109,6 +114,12 @@ void WhitelistFilter::cacheRestrictedMode(const std::vector<std::string>& device
     }
 }
 
+/** @brief Update RestrictionMode if any changes in RestrictionMode
+ *  @param[in] m - sdbusplus message. Using this to get Updated Mode dbus path
+ *  @param[in] deviceList - map to store devices path and their index
+ *  @returns void.
+ */
+
 void WhitelistFilter::handleRestrictedModeChange(sdbusplus::message::message& m, const std::map<std::string, size_t>& deviceList)
 {
     using namespace sdbusplus::xyz::openbmc_project::Control::Security::server;
@@ -145,6 +156,11 @@ void WhitelistFilter::handleRestrictedModeChange(sdbusplus::message::message& m,
     }
 }
 
+/** @brief Get and Update RestrictionModes of supported devices
+ *  @param[in] void
+ *  @returns void.
+ */
+
 void WhitelistFilter::postInit()
 {
     objects = std::make_unique<settings::Objects>(
@@ -169,15 +185,17 @@ void WhitelistFilter::postInit()
 
     // Initialize restricted mode
     cacheRestrictedMode(devices);
+
     // Wait for changes on Restricted mode
-    std::string filterStr;
-    const std::string devicesDbusPath{"/xyz/openbmc_project/control"};
     std::map<std::string, size_t> deviceList;
 
     for(size_t index=0; index<devices.size(); index++)
     {
         deviceList.emplace(devices[index], index);
     }
+ 
+    std::string filterStr;
+    std::string devicesDbusPath{"/xyz/openbmc_project/control"};
 
     filterStr = sdbusplus::bus::match::rules::propertiesChangedNamespace(
 		    devicesDbusPath, restrictionModeIntf);
@@ -187,6 +205,11 @@ void WhitelistFilter::postInit()
             handleRestrictedModeChange(m , deviceList);
         });
 }
+
+/** @brief Filter IPMI messages with RestrictedMode
+ *  @param[in] request - IPMI messahe request
+ *  @returns IPMI completion code success or error.
+ */
 
 ipmi::Cc WhitelistFilter::filterMessage(ipmi::message::Request::ptr request)
 {
