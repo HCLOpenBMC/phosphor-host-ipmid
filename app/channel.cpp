@@ -4,18 +4,28 @@
 
 #include <arpa/inet.h>
 
-#include <boost/process/child.hpp>
-#include <fstream>
 #include <ipmid/types.hpp>
 #include <ipmid/utils.hpp>
 #include <phosphor-logging/elog-errors.hpp>
-#include <phosphor-logging/log.hpp>
-#include <set>
-#include <string>
+#include <phosphor-logging/lg2.hpp>
 #include <xyz/openbmc_project/Common/error.hpp>
 
+#include <fstream>
+#include <set>
+#include <string>
+
 using namespace phosphor::logging;
-using namespace sdbusplus::xyz::openbmc_project::Common::Error;
+using namespace sdbusplus::error::xyz::openbmc_project::common;
+
+namespace ipmi
+{
+constexpr Cc ccPayloadTypeNotSupported = 0x80;
+
+static inline auto responsePayloadTypeNotSupported()
+{
+    return response(ccPayloadTypeNotSupported);
+}
+} // namespace ipmi
 
 namespace cipher
 {
@@ -42,14 +52,14 @@ std::pair<std::vector<uint8_t>, std::vector<uint8_t>> getCipherRecords()
     std::ifstream jsonFile(configFile);
     if (!jsonFile.is_open())
     {
-        log<level::ERR>("Channel Cipher suites file not found");
+        lg2::error("Channel Cipher suites file not found");
         elog<InternalFailure>();
     }
 
     auto data = Json::parse(jsonFile, nullptr, false);
     if (data.is_discarded())
     {
-        log<level::ERR>("Parsing channel cipher suites JSON failed");
+        lg2::error("Parsing channel cipher suites JSON failed");
         elog<InternalFailure>();
     }
 
@@ -130,9 +140,8 @@ ipmi::RspType<uint8_t,             // Channel Number
     }
     if (!ipmi::isValidPayloadType(static_cast<ipmi::PayloadType>(payloadType)))
     {
-        log<level::DEBUG>("Get channel cipher suites - Invalid payload type");
-        constexpr uint8_t ccPayloadTypeNotSupported = 0x80;
-        return ipmi::response(ccPayloadTypeNotSupported);
+        lg2::debug("Get channel cipher suites - Invalid payload type");
+        return ipmi::responsePayloadTypeNotSupported();
     }
 
     if (!recordInit)
@@ -158,7 +167,7 @@ ipmi::RspType<uint8_t,             // Channel Number
          ipmi::EChannelSessSupported::none) ||
         !(ipmi::doesDeviceExist(rspChannel)))
     {
-        log<level::DEBUG>("Get channel cipher suites - Device does not exist");
+        lg2::debug("Get channel cipher suites - Device does not exist");
         return ipmi::responseInvalidFieldRequest();
     }
 
@@ -176,69 +185,4 @@ ipmi::RspType<uint8_t,             // Channel Number
     std::copy_n(records.data() + start, size, std::back_inserter(rspRecords));
 
     return ipmi::responseSuccess(rspChannel, rspRecords);
-}
-
-template <typename... ArgTypes>
-static int executeCmd(const char* path, ArgTypes&&... tArgs)
-{
-    boost::process::child execProg(path, const_cast<char*>(tArgs)...);
-    execProg.wait();
-    return execProg.exit_code();
-}
-
-/** @brief Enable the network IPMI service on the specified ethernet interface.
- *
- *  @param[in] intf - ethernet interface on which to enable IPMI
- */
-void enableNetworkIPMI(const std::string& intf)
-{
-    // Check if there is a iptable filter to drop IPMI packets for the
-    // interface.
-    auto retCode =
-        executeCmd("/usr/sbin/iptables", "-C", "INPUT", "-p", "udp", "-i",
-                   intf.c_str(), "--dport", "623", "-j", "DROP");
-
-    // If the iptable filter exists, delete the filter.
-    if (!retCode)
-    {
-        auto response =
-            executeCmd("/usr/sbin/iptables", "-D", "INPUT", "-p", "udp", "-i",
-                       intf.c_str(), "--dport", "623", "-j", "DROP");
-
-        if (response)
-        {
-            log<level::ERR>("Dropping the iptables filter failed",
-                            entry("INTF=%s", intf.c_str()),
-                            entry("RETURN_CODE:%d", response));
-        }
-    }
-}
-
-/** @brief Disable the network IPMI service on the specified ethernet interface.
- *
- *  @param[in] intf - ethernet interface on which to disable IPMI
- */
-void disableNetworkIPMI(const std::string& intf)
-{
-    // Check if there is a iptable filter to drop IPMI packets for the
-    // interface.
-    auto retCode =
-        executeCmd("/usr/sbin/iptables", "-C", "INPUT", "-p", "udp", "-i",
-                   intf.c_str(), "--dport", "623", "-j", "DROP");
-
-    // If the iptable filter does not exist, add filter to drop network IPMI
-    // packets
-    if (retCode)
-    {
-        auto response =
-            executeCmd("/usr/sbin/iptables", "-I", "INPUT", "-p", "udp", "-i",
-                       intf.c_str(), "--dport", "623", "-j", "DROP");
-
-        if (response)
-        {
-            log<level::ERR>("Inserting iptables filter failed",
-                            entry("INTF=%s", intf.c_str()),
-                            entry("RETURN_CODE:%d", response));
-        }
-    }
 }

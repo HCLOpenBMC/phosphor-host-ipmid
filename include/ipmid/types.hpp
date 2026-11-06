@@ -1,9 +1,11 @@
 #pragma once
 
+#include <openssl/crypto.h>
 #include <stdint.h>
 
-#include <map>
 #include <sdbusplus/server.hpp>
+
+#include <map>
 #include <string>
 #include <variant>
 
@@ -16,8 +18,14 @@ using DbusInterface = std::string;
 using DbusObjectInfo = std::pair<DbusObjectPath, DbusService>;
 using DbusProperty = std::string;
 
+using Association = std::tuple<std::string, std::string, std::string>;
+using BootProgressCode = std::tuple<std::vector<uint8_t>, std::vector<uint8_t>>;
+
 using Value = std::variant<bool, uint8_t, int16_t, uint16_t, int32_t, uint32_t,
-                           int64_t, uint64_t, double, std::string>;
+                           int64_t, uint64_t, double, std::string,
+                           std::vector<uint8_t>, std::vector<uint16_t>,
+                           std::vector<uint32_t>, std::vector<std::string>,
+                           std::vector<Association>, BootProgressCode>;
 
 using PropertyMap = std::map<DbusProperty, Value>;
 
@@ -28,8 +36,7 @@ using InterfaceList = std::vector<std::string>;
 
 using DbusInterfaceMap = std::map<DbusInterface, PropertyMap>;
 
-using ObjectValueTree =
-    std::map<sdbusplus::message::object_path, DbusInterfaceMap>;
+using ObjectValueTree = std::map<sdbusplus::object_path, DbusInterfaceMap>;
 
 namespace sensor
 {
@@ -130,6 +137,7 @@ using Unit = std::string;
 using EntityType = uint8_t;
 using EntityInst = uint8_t;
 using SensorName = std::string;
+using SensorUnits1 = uint8_t;
 
 enum class Mutability
 {
@@ -139,14 +147,14 @@ enum class Mutability
 
 inline Mutability operator|(Mutability lhs, Mutability rhs)
 {
-    return static_cast<Mutability>(static_cast<uint8_t>(lhs) |
-                                   static_cast<uint8_t>(rhs));
+    return static_cast<Mutability>(
+        static_cast<uint8_t>(lhs) | static_cast<uint8_t>(rhs));
 }
 
 inline Mutability operator&(Mutability lhs, Mutability rhs)
 {
-    return static_cast<Mutability>(static_cast<uint8_t>(lhs) &
-                                   static_cast<uint8_t>(rhs));
+    return static_cast<Mutability>(
+        static_cast<uint8_t>(lhs) & static_cast<uint8_t>(rhs));
 }
 
 struct Info
@@ -164,9 +172,16 @@ struct Info
     Exponent exponentR;
     bool hasScale;
     Scale scale;
+    SensorUnits1 sensorUnits1;
     Unit unit;
     std::function<uint8_t(SetSensorReadingReq&, const Info&)> updateFunc;
+#ifndef FEATURE_SENSORS_CACHE
     std::function<GetSensorResponse(const Info&)> getFunc;
+#else
+    std::function<std::optional<GetSensorResponse>(uint8_t, const Info&,
+                                                   const ipmi::PropertyMap&)>
+        getFunc;
+#endif
     Mutability mutability;
     SensorName sensorName;
     std::function<SensorName(const Info&)> sensorNameFunc;
@@ -180,10 +195,10 @@ using PropertyMap = ipmi::PropertyMap;
 
 using InterfaceMap = std::map<DbusInterface, PropertyMap>;
 
-using Object = sdbusplus::message::object_path;
+using Object = sdbusplus::object_path;
 using ObjectMap = std::map<Object, InterfaceMap>;
 
-using IpmiUpdateData = sdbusplus::message::message;
+using IpmiUpdateData = sdbusplus::message_t;
 
 struct SelData
 {
@@ -201,8 +216,10 @@ enum class ThresholdMask
 {
     NON_CRITICAL_LOW_MASK = 0x01,
     CRITICAL_LOW_MASK = 0x02,
+    NON_RECOVERABLE_LOW_MASK = 0x4,
     NON_CRITICAL_HIGH_MASK = 0x08,
     CRITICAL_HIGH_MASK = 0x10,
+    NON_RECOVERABLE_HIGH_MASK = 0x20,
 };
 
 static constexpr uint8_t maxContainedEntities = 4;
@@ -220,6 +237,23 @@ struct EntityInfo
 
 using EntityInfoMap = std::map<Id, EntityInfo>;
 
+#ifdef FEATURE_SENSORS_CACHE
+/**
+ * @struct SensorData
+ *
+ * The data to cache for sensors
+ */
+struct SensorData
+{
+    double value;
+    bool available;
+    bool functional;
+    GetSensorResponse response;
+};
+
+using SensorCacheMap = std::map<uint8_t, std::optional<SensorData>>;
+#endif
+
 } // namespace sensor
 
 namespace network
@@ -234,4 +268,58 @@ constexpr auto DEFAULT_ADDRESS = "0.0.0.0";
 
 } // namespace network
 
+template <typename T>
+class SecureAllocator : public std::allocator<T>
+{
+  public:
+    template <typename U>
+    struct rebind
+    {
+        typedef SecureAllocator<U> other;
+    };
+
+    void deallocate(T* p, size_t n)
+    {
+        OPENSSL_cleanse(p, n);
+        return std::allocator<T>::deallocate(p, n);
+    }
+};
+
+using SecureStringBase =
+    std::basic_string<char, std::char_traits<char>, SecureAllocator<char>>;
+class SecureString : public SecureStringBase
+{
+  public:
+    using SecureStringBase::basic_string;
+    SecureString(const SecureStringBase& other) : SecureStringBase(other) {};
+    SecureString(SecureString&) = default;
+    SecureString(const SecureString&) = default;
+    SecureString(SecureString&&) = default;
+    SecureString& operator=(SecureString&&) = default;
+    SecureString& operator=(const SecureString&) = default;
+
+    ~SecureString()
+    {
+        OPENSSL_cleanse(this->data(), this->size());
+    }
+};
+
+using SecureBufferBase = std::vector<uint8_t, SecureAllocator<uint8_t>>;
+
+class SecureBuffer : public SecureBufferBase
+{
+  public:
+    using SecureBufferBase::vector;
+    SecureBuffer(const SecureBufferBase& other) : SecureBufferBase(other) {};
+    SecureBuffer(SecureBuffer&) = default;
+    SecureBuffer(const SecureBuffer&) = default;
+    SecureBuffer(SecureBuffer&&) = default;
+    SecureBuffer& operator=(SecureBuffer&&) = default;
+    SecureBuffer& operator=(const SecureBuffer&) = default;
+
+    ~SecureBuffer()
+    {
+        OPENSSL_cleanse(this->data(), this->size());
+    }
+};
 } // namespace ipmi

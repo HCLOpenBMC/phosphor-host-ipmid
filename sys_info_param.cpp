@@ -1,7 +1,7 @@
 #include "sys_info_param.hpp"
 
-std::tuple<bool, std::string>
-    SysInfoParamStore::lookup(uint8_t paramSelector) const
+std::tuple<bool, std::string> SysInfoParamStore::lookup(
+    uint8_t paramSelector) const
 {
     const auto iterator = params.find(paramSelector);
     if (iterator == params.end())
@@ -9,8 +9,7 @@ std::tuple<bool, std::string>
         return std::make_tuple(false, "");
     }
 
-    auto& callback = iterator->second;
-    auto s = callback();
+    auto s = iterator->second();
     return std::make_tuple(true, s);
 }
 
@@ -30,4 +29,19 @@ void SysInfoParamStore::update(uint8_t paramSelector,
                                const std::function<std::string()>& callback)
 {
     params[paramSelector] = callback;
+}
+
+void SysInfoParamStore::updateEncoding(uint8_t paramSelector, uint8_t encoding)
+{
+    encodings[paramSelector] = encoding;
+}
+
+uint8_t SysInfoParamStore::lookupEncoding(uint8_t paramSelector) const
+{
+    const auto it = encodings.find(paramSelector);
+    if (it == encodings.end())
+    {
+        return 0;
+    }
+    return it->second;
 }

@@ -14,11 +14,12 @@
  * limitations under the License.
  */
 #pragma once
-#include <algorithm>
 #include <boost/callable_traits.hpp>
-#include <cstdint>
 #include <ipmid/api-types.hpp>
 #include <ipmid/message.hpp>
+
+#include <algorithm>
+#include <cstdint>
 #include <memory>
 #include <tuple>
 #include <utility>
@@ -39,6 +40,8 @@ class FilterBase
   public:
     using ptr = std::shared_ptr<FilterBase>;
 
+    virtual ~FilterBase() = default;
+
     virtual ipmi::Cc call(message::Request::ptr request) = 0;
 };
 
@@ -51,7 +54,7 @@ class FilterBase
  *
  * Filters are called with a ipmi::message::Request shared_ptr on all IPMI
  * commands in priority order and each filter has the opportunity to reject the
- * command (by returning an IPMI error competion code.) If all the filters
+ * command (by returning an IPMI error completion code.) If all the filters
  * return success, the actual IPMI command will be executed. Filters can reject
  * the command for any reason, based on system state, the context, the command
  * payload, etc.
@@ -60,9 +63,7 @@ template <typename Filter>
 class IpmiFilter : public FilterBase
 {
   public:
-    IpmiFilter(Filter&& filter) : filter_(std::move(filter))
-    {
-    }
+    IpmiFilter(Filter&& filter) : filter_(std::move(filter)) {}
 
     ipmi::Cc call(message::Request::ptr request) override
     {
@@ -108,7 +109,7 @@ void registerFilter(int prio, ::ipmi::FilterBase::ptr filter);
  *
  * Filters are called with a ipmi::message::Request shared_ptr on all IPMI
  * commands in priority order and each filter has the opportunity to reject the
- * command (by returning an IPMI error competion code.) If all the filters
+ * command (by returning an IPMI error completion code.) If all the filters
  * return success, the actual IPMI command will be executed. Filters can reject
  * the command for any reason, based on system state, the context, the command
  * payload, etc.

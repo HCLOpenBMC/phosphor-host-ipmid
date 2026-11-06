@@ -1,30 +1,30 @@
-#include <cstdio>
+#include <ipmid/api-types.hpp>
 #include <ipmid/api.hpp>
+#include <phosphor-logging/lg2.hpp>
 
-#define GRPEXT_GET_GROUP_CMD 0
-void register_netfn_groupext_functions() __attribute__((constructor));
-
-ipmi_ret_t ipmi_groupext(ipmi_netfn_t netfn, ipmi_cmd_t cmd,
-                         ipmi_request_t request, ipmi_response_t response,
-                         ipmi_data_len_t data_len, ipmi_context_t context)
+namespace group
 {
+constexpr ipmi::Cmd cmdGetGroupExt = 0x0;
+} // namespace group
+
+void registerNetFnGroupExtFunctions() __attribute__((constructor));
+
+ipmi::RspType<uint8_t> ipmiGroupExt()
+{
+    lg2::info("IPMI GROUP EXTENSIONS");
+
     // Generic return from IPMI commands.
-    ipmi_ret_t rc = IPMI_CC_OK;
-    uint8_t* p = (uint8_t*)response;
+    constexpr uint8_t respData = 0;
 
-    std::printf("IPMI GROUP EXTENSIONS\n");
-
-    *data_len = 1;
-    *p = 0;
-
-    return rc;
+    return ipmi::responseSuccess(respData);
 }
 
-void register_netfn_groupext_functions()
+void registerNetFnGroupExtFunctions()
 {
     // <Group Extension Command>
-    ipmi_register_callback(NETFUN_GRPEXT, GRPEXT_GET_GROUP_CMD, NULL,
-                           ipmi_groupext, PRIVILEGE_USER);
+    ipmi::registerGroupHandler(ipmi::prioOpenBmcBase, ipmi::groupDCMI,
+                               group::cmdGetGroupExt, ipmi::Privilege::User,
+                               ipmiGroupExt);
 
     return;
 }

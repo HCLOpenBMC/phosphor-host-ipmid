@@ -2,20 +2,27 @@
 
 #include "selutility.hpp"
 
-#include <charconv>
-#include <chrono>
-#include <filesystem>
 #include <ipmid/api.hpp>
 #include <ipmid/types.hpp>
 #include <ipmid/utils.hpp>
 #include <phosphor-logging/elog-errors.hpp>
-#include <vector>
+#include <phosphor-logging/lg2.hpp>
 #include <xyz/openbmc_project/Common/error.hpp>
+#include <xyz/openbmc_project/ObjectMapper/common.hpp>
+
+#include <charconv>
+#include <chrono>
+#include <filesystem>
+#include <vector>
 
 extern const ipmi::sensor::InvObjectIDMap invSensors;
 using namespace phosphor::logging;
 using InternalFailure =
-    sdbusplus::xyz::openbmc_project::Common::Error::InternalFailure;
+    sdbusplus::error::xyz::openbmc_project::common::InternalFailure;
+using ResourceNotFound =
+    sdbusplus::error::xyz::openbmc_project::common::ResourceNotFound;
+
+using ObjectMapper = sdbusplus::common::xyz::openbmc_project::ObjectMapper;
 
 namespace
 {
@@ -54,33 +61,11 @@ inline bool isRecordOEM(uint8_t recordType)
     return recordType != systemEventRecord;
 }
 
-using additionalDataMap = std::map<std::string, std::string>;
 using entryDataMap = std::map<PropertyName, PropertyType>;
-/** Parse the entry with format like key=val */
-std::pair<std::string, std::string> parseEntry(const std::string& entry)
-{
-    constexpr auto equalSign = "=";
-    auto pos = entry.find(equalSign);
-    assert(pos != std::string::npos);
-    auto key = entry.substr(0, pos);
-    auto val = entry.substr(pos + 1);
-    return {key, val};
-}
-
-additionalDataMap parseAdditionalData(const AdditionalData& data)
-{
-    std::map<std::string, std::string> ret;
-
-    for (const auto& d : data)
-    {
-        ret.insert(parseEntry(d));
-    }
-    return ret;
-}
 
 int convert(const std::string_view& str, int base = 10)
 {
-    int ret;
+    int ret = 0;
     std::from_chars(str.data(), str.data() + str.size(), ret, base);
     return ret;
 }
@@ -101,10 +86,10 @@ std::vector<uint8_t> convertVec(const std::string_view& str)
 
 /** Construct OEM SEL record according to IPMI spec 32.2, 32.3. */
 void constructOEMSEL(uint8_t recordType, std::chrono::milliseconds timestamp,
-                     const additionalDataMap& m, GetSELEntryResponse& record)
+                     const AdditionalData& data, GetSELEntryResponse& record)
 {
-    auto dataIter = m.find(strSensorData);
-    assert(dataIter != m.end());
+    auto dataIter = data.find(strSensorData);
+    assert(dataIter != data.end());
     auto sensorData = convertVec(dataIter->second);
     if (recordType >= 0xC0 && recordType < 0xE0)
     {
@@ -127,12 +112,12 @@ void constructOEMSEL(uint8_t recordType, std::chrono::milliseconds timestamp,
 }
 
 void constructSEL(uint8_t recordType, std::chrono::milliseconds timestamp,
-                  const additionalDataMap& m, const entryDataMap& entryData,
+                  const AdditionalData& data, const entryDataMap&,
                   GetSELEntryResponse& record)
 {
     if (recordType != systemEventRecord)
     {
-        log<level::ERR>("Invalid recordType");
+        lg2::error("Invalid recordType");
         elog<InternalFailure>();
     }
 
@@ -141,8 +126,8 @@ void constructSEL(uint8_t recordType, std::chrono::milliseconds timestamp,
     record.event.eventRecord.sensorNum = 0xFF;
     record.event.eventRecord.eventType = 0;
 
-    auto iter = m.find(strSensorPath);
-    assert(iter != m.end());
+    auto iter = data.find(strSensorPath);
+    assert(iter != data.end());
     const auto& sensorPath = iter->second;
     auto sensorIter = invSensors.find(sensorPath);
 
@@ -152,8 +137,8 @@ void constructSEL(uint8_t recordType, std::chrono::milliseconds timestamp,
         record.event.eventRecord.sensorType = sensorIter->second.sensorType;
         record.event.eventRecord.sensorNum = sensorIter->second.sensorID;
 
-        iter = m.find(strEventDir);
-        assert(iter != m.end());
+        iter = data.find(strEventDir);
+        assert(iter != data.end());
         auto eventDir = static_cast<uint8_t>(convert(iter->second));
         uint8_t assert = eventDir ? assertEvent : deassertEvent;
         record.event.eventRecord.eventType =
@@ -162,26 +147,26 @@ void constructSEL(uint8_t recordType, std::chrono::milliseconds timestamp,
     record.event.eventRecord.recordType = recordType;
     record.event.eventRecord.timeStamp = static_cast<uint32_t>(
         std::chrono::duration_cast<std::chrono::seconds>(timestamp).count());
-    iter = m.find(strGenerateId);
-    assert(iter != m.end());
+    iter = data.find(strGenerateId);
+    assert(iter != data.end());
     record.event.eventRecord.generatorID =
         static_cast<uint16_t>(convert(iter->second));
     record.event.eventRecord.eventMsgRevision = eventMsgRevision;
-    iter = m.find(strSensorData);
-    assert(iter != m.end());
+    iter = data.find(strSensorData);
+    assert(iter != data.end());
     auto sensorData = convertVec(iter->second);
     // The remaining 3 bytes are the sensor data
     memcpy(&record.event.eventRecord.eventData1, sensorData.data(),
            std::min(sensorData.size(), static_cast<size_t>(selDataSize)));
 }
 
-GetSELEntryResponse
-    prepareSELEntry(const std::string& objPath,
-                    ipmi::sensor::InvObjectIDMap::const_iterator iter)
+GetSELEntryResponse prepareSELEntry(
+    const std::string& objPath,
+    ipmi::sensor::InvObjectIDMap::const_iterator iter)
 {
     GetSELEntryResponse record{};
 
-    sdbusplus::bus::bus bus{ipmid_get_sd_bus_connection()};
+    sdbusplus::bus_t bus{ipmid_get_sd_bus_connection()};
     auto service = ipmi::getService(bus, logEntryIntf, objPath);
 
     // Read all the log entry properties.
@@ -189,22 +174,25 @@ GetSELEntryResponse
                                           propIntf, "GetAll");
     methodCall.append(logEntryIntf);
 
-    auto reply = bus.call(methodCall);
-    if (reply.is_method_error())
+    entryDataMap entryData;
+    try
     {
-        log<level::ERR>("Error in reading logging property entries");
+        auto reply = bus.call(methodCall);
+        reply.read(entryData);
+    }
+    catch (const std::exception& e)
+    {
+        lg2::error("Error in reading logging property entries: {ERROR}",
+                   "ERROR", e);
         elog<InternalFailure>();
     }
-
-    entryDataMap entryData;
-    reply.read(entryData);
 
     // Read Id from the log entry.
     static constexpr auto propId = "Id";
     auto iterId = entryData.find(propId);
     if (iterId == entryData.end())
     {
-        log<level::ERR>("Error in reading Id of logging entry");
+        lg2::error("Error in reading Id of logging entry");
         elog<InternalFailure>();
     }
 
@@ -213,43 +201,62 @@ GetSELEntryResponse
     auto iterTimeStamp = entryData.find(propTimeStamp);
     if (iterTimeStamp == entryData.end())
     {
-        log<level::ERR>("Error in reading Timestamp of logging entry");
+        lg2::error("Error in reading Timestamp of logging entry");
         elog<InternalFailure>();
     }
     std::chrono::milliseconds chronoTimeStamp(
         std::get<uint64_t>(iterTimeStamp->second));
 
-    if (iter == invSensors.end())
+    bool isFromSELLogger = false;
+
+    // The recordID are with the same offset between different types,
+    // so we are safe to set the recordID here
+    record.event.eventRecord.recordID =
+        static_cast<uint16_t>(std::get<uint32_t>(iterId->second));
+
+    iterId = entryData.find(propAdditionalData);
+    if (iterId != entryData.end())
     {
-        // It is expected to be a custom SEL entry
-        // The recordID are with the same offset between different types,
-        // so we are safe to set the recordID here
-        record.event.eventRecord.recordID =
-            static_cast<uint16_t>(std::get<uint32_t>(iterId->second));
-        iterId = entryData.find(propAdditionalData);
-        if (iterId == entryData.end())
-        {
-            log<level::ERR>("Error finding AdditionalData");
-            elog<InternalFailure>();
-        }
+        // Check if it's a SEL from phosphor-sel-logger which shall contain
+        // the record ID, etc
         const auto& addData = std::get<AdditionalData>(iterId->second);
-        auto m = parseAdditionalData(addData);
-        auto recordType = static_cast<uint8_t>(convert(m[strRecordType]));
-        auto isOEM = isRecordOEM(recordType);
-        if (isOEM)
+        auto recordTypeIter = addData.find(strRecordType);
+        if (recordTypeIter != addData.end())
         {
-            constructOEMSEL(recordType, chronoTimeStamp, m, record);
+            // It is a SEL from phosphor-sel-logger
+            isFromSELLogger = true;
         }
         else
         {
-            constructSEL(recordType, chronoTimeStamp, m, entryData, record);
+            // Not a SEL from phosphor-sel-logger, it shall have a valid
+            // invSensor
+            if (iter == invSensors.end())
+            {
+                lg2::error("System event sensor not found");
+                elog<InternalFailure>();
+            }
+        }
+    }
+
+    if (isFromSELLogger)
+    {
+        // It is expected to be a custom SEL entry
+        const auto& addData = std::get<AdditionalData>(iterId->second);
+        auto recordType =
+            static_cast<uint8_t>(convert(addData.find(strRecordType)->second));
+        auto isOEM = isRecordOEM(recordType);
+        if (isOEM)
+        {
+            constructOEMSEL(recordType, chronoTimeStamp, addData, record);
+        }
+        else
+        {
+            constructSEL(recordType, chronoTimeStamp, addData, entryData,
+                         record);
         }
     }
     else
     {
-
-        record.event.eventRecord.recordID =
-            static_cast<uint16_t>(std::get<uint32_t>(iterId->second));
         record.event.eventRecord.timeStamp = static_cast<uint32_t>(
             std::chrono::duration_cast<std::chrono::seconds>(chronoTimeStamp)
                 .count());
@@ -266,7 +273,7 @@ GetSELEntryResponse
         auto iterResolved = entryData.find(propResolved);
         if (iterResolved == entryData.end())
         {
-            log<level::ERR>("Error in reading Resolved field of logging entry");
+            lg2::error("Error in reading Resolved field of logging entry");
             elog<InternalFailure>();
         }
 
@@ -289,34 +296,26 @@ GetSELEntryResponse
 
 GetSELEntryResponse convertLogEntrytoSEL(const std::string& objPath)
 {
-    sdbusplus::bus::bus bus{ipmid_get_sd_bus_connection()};
+    sdbusplus::bus_t bus{ipmid_get_sd_bus_connection()};
 
     static constexpr auto assocIntf =
         "xyz.openbmc_project.Association.Definitions";
     static constexpr auto assocProp = "Associations";
 
-    auto service = ipmi::getService(bus, assocIntf, objPath);
-
-    // Read the Associations interface.
-    auto methodCall =
-        bus.new_method_call(service.c_str(), objPath.c_str(), propIntf, "Get");
-    methodCall.append(assocIntf);
-    methodCall.append(assocProp);
-
-    auto reply = bus.call(methodCall);
-    if (reply.is_method_error())
+    std::vector<ipmi::Association> assocs;
+    try
     {
-        log<level::ERR>("Error in reading Associations interface");
+        auto service = ipmi::getService(bus, assocIntf, objPath);
+        auto propValue =
+            ipmi::getDbusProperty(bus, service, objPath, assocIntf, assocProp);
+        assocs = std::get<std::vector<ipmi::Association>>(propValue);
+    }
+    catch (const std::exception& e)
+    {
+        lg2::error("Error in reading Associations interface: {ERROR}", "ERROR",
+                   e);
         elog<InternalFailure>();
     }
-
-    using AssociationList =
-        std::vector<std::tuple<std::string, std::string, std::string>>;
-
-    std::variant<AssociationList> list;
-    reply.read(list);
-
-    auto& assocs = std::get<AssociationList>(list);
 
     /*
      * Check if the log entry has any callout associations, if there is a
@@ -333,7 +332,7 @@ GetSELEntryResponse convertLogEntrytoSEL(const std::string& objPath)
                 iter = invSensors.find(BOARD_SENSOR);
                 if (iter == invSensors.end())
                 {
-                    log<level::ERR>("Motherboard sensor not found");
+                    lg2::error("Motherboard sensor not found");
                     elog<InternalFailure>();
                 }
             }
@@ -350,65 +349,69 @@ GetSELEntryResponse convertLogEntrytoSEL(const std::string& objPath)
 
 std::chrono::seconds getEntryTimeStamp(const std::string& objPath)
 {
-    sdbusplus::bus::bus bus{ipmid_get_sd_bus_connection()};
+    sdbusplus::bus_t bus{ipmid_get_sd_bus_connection()};
 
-    auto service = ipmi::getService(bus, logEntryIntf, objPath);
+    static constexpr auto propTimeStamp = "Timestamp";
 
-    using namespace std::string_literals;
-    static const auto propTimeStamp = "Timestamp"s;
-
-    auto methodCall =
-        bus.new_method_call(service.c_str(), objPath.c_str(), propIntf, "Get");
-    methodCall.append(logEntryIntf);
-    methodCall.append(propTimeStamp);
-
-    auto reply = bus.call(methodCall);
-    if (reply.is_method_error())
+    uint64_t timeStamp;
+    try
     {
-        log<level::ERR>("Error in reading Timestamp from Entry interface");
+        auto service = ipmi::getService(bus, logEntryIntf, objPath);
+        auto propValue = ipmi::getDbusProperty(bus, service, objPath,
+                                               logEntryIntf, propTimeStamp);
+        timeStamp = std::get<uint64_t>(propValue);
+    }
+    catch (const std::exception& e)
+    {
+        lg2::error("Error in reading Timestamp from Entry interface: {ERROR}",
+                   "ERROR", e);
         elog<InternalFailure>();
     }
 
-    std::variant<uint64_t> timeStamp;
-    reply.read(timeStamp);
-
-    std::chrono::milliseconds chronoTimeStamp(std::get<uint64_t>(timeStamp));
+    std::chrono::milliseconds chronoTimeStamp(timeStamp);
 
     return std::chrono::duration_cast<std::chrono::seconds>(chronoTimeStamp);
 }
 
 void readLoggingObjectPaths(ObjectPaths& paths)
 {
-    sdbusplus::bus::bus bus{ipmid_get_sd_bus_connection()};
+    sdbusplus::bus_t bus{ipmid_get_sd_bus_connection()};
     auto depth = 0;
     paths.clear();
 
-    auto mapperCall = bus.new_method_call(mapperBusName, mapperObjPath,
-                                          mapperIntf, "GetSubTreePaths");
+    auto mapperCall = bus.new_method_call(
+        ObjectMapper::default_service, ObjectMapper::instance_path,
+        ObjectMapper::interface,
+        ObjectMapper::method_names::get_sub_tree_paths);
     mapperCall.append(logBasePath);
     mapperCall.append(depth);
     mapperCall.append(ObjectPaths({logEntryIntf}));
 
-    auto reply = bus.call(mapperCall);
-    if (reply.is_method_error())
+    try
     {
-        log<level::INFO>("Error in reading logging entry object paths");
-    }
-    else
-    {
+        auto reply = bus.call(mapperCall);
         reply.read(paths);
-
-        std::sort(paths.begin(), paths.end(),
-                  [](const std::string& a, const std::string& b) {
-                      namespace fs = std::filesystem;
-                      fs::path pathA(a);
-                      fs::path pathB(b);
-                      auto idA = std::stoul(pathA.filename().string());
-                      auto idB = std::stoul(pathB.filename().string());
-
-                      return idA < idB;
-                  });
     }
+    catch (const sdbusplus::exception_t& e)
+    {
+        // ResourceNotFound is a legacy error, so match by name.
+        if (std::string_view{ResourceNotFound::errName} != e.name())
+        {
+            throw;
+        }
+        // No log entries exist; leave paths empty.
+    }
+
+    std::sort(paths.begin(), paths.end(),
+              [](const std::string& a, const std::string& b) {
+                  namespace fs = std::filesystem;
+                  fs::path pathA(a);
+                  fs::path pathB(b);
+                  auto idA = std::stoul(pathA.filename().string());
+                  auto idB = std::stoul(pathB.filename().string());
+
+                  return idA < idB;
+              });
 }
 
 } // namespace sel

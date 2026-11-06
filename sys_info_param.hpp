@@ -12,9 +12,7 @@
 class SysInfoParamStoreIntf
 {
   public:
-    virtual ~SysInfoParamStoreIntf()
-    {
-    }
+    virtual ~SysInfoParamStoreIntf() {}
 
     /**
      * Returns true if parameter is found. If and only if s is non-null,
@@ -24,8 +22,8 @@ class SysInfoParamStoreIntf
      * @return tuple of bool and string, true if parameter is found and
      * string set accordingly.
      */
-    virtual std::tuple<bool, std::string>
-        lookup(uint8_t paramSelector) const = 0;
+    virtual std::tuple<bool, std::string> lookup(
+        uint8_t paramSelector) const = 0;
 
     /**
      * Update a parameter by its code with a string value.
@@ -46,6 +44,23 @@ class SysInfoParamStoreIntf
     virtual void update(uint8_t paramSelector,
                         const std::function<std::string()>& callback) = 0;
 
+    /**
+     * Store the encoding type for a parameter.
+     *
+     * @param[in] paramSelector - the key to update.
+     * @param[in] encoding - the encoding value to store.
+     */
+    virtual void updateEncoding(uint8_t paramSelector, uint8_t encoding) = 0;
+
+    /**
+     * Retrieve the encoding type for a parameter.
+     * Returns 0 (ASCII) if no encoding has been stored for this parameter.
+     *
+     * @param[in] paramSelector - the key to lookup.
+     * @return the encoding value, or 0 if not set.
+     */
+    virtual uint8_t lookupEncoding(uint8_t paramSelector) const = 0;
+
     // TODO: Store "read-only" flag for each parameter.
     // TODO: Function to erase a parameter?
 };
@@ -60,7 +75,10 @@ class SysInfoParamStore : public SysInfoParamStoreIntf
     void update(uint8_t paramSelector, const std::string& s) override;
     void update(uint8_t paramSelector,
                 const std::function<std::string()>& callback) override;
+    void updateEncoding(uint8_t paramSelector, uint8_t encoding) override;
+    uint8_t lookupEncoding(uint8_t paramSelector) const override;
 
   private:
     std::map<uint8_t, std::function<std::string()>> params;
+    std::map<uint8_t, uint8_t> encodings;
 };

@@ -14,8 +14,11 @@
 // limitations under the License.
 */
 #pragma once
-#include <array>
+#include <openssl/crypto.h>
+
 #include <ipmid/api.hpp>
+
+#include <array>
 #include <string>
 
 namespace ipmi
@@ -24,8 +27,19 @@ namespace ipmi
 static constexpr uint8_t maxIpmiChannels = 16;
 static constexpr uint8_t currentChNum = 0xE;
 static constexpr uint8_t invalidChannel = 0xff;
-static constexpr const uint8_t ccActionNotSupportedForChannel = 0x82;
-static constexpr const uint8_t ccAccessModeNotSupportedForChannel = 0x83;
+
+constexpr Cc ccActionNotSupportedForChannel = 0x82;
+constexpr Cc ccAccessModeNotSupportedForChannel = 0x83;
+
+static inline auto responseActionNotSupportedForChannel()
+{
+    return response(ccActionNotSupportedForChannel);
+}
+
+static inline auto responseAccessModeNotSupportedForChannel()
+{
+    return response(ccAccessModeNotSupportedForChannel);
+}
 
 /**
  * @array of privilege levels
@@ -237,7 +251,7 @@ EChannelSessSupported getChannelSessionSupport(const uint8_t chNum);
  *
  *  @param[in] chNum - channel number
  *
- *  @return numer of active sessions
+ *  @return number of active sessions
  */
 int getChannelActiveSessions(const uint8_t chNum);
 

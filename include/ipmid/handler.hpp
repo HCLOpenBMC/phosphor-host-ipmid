@@ -14,18 +14,23 @@
  * limitations under the License.
  */
 #pragma once
-#include <algorithm>
+#include <cxxabi.h>
+
 #include <boost/asio/spawn.hpp>
 #include <boost/callable_traits.hpp>
-#include <cstdint>
-#include <exception>
 #include <ipmid/api-types.hpp>
 #include <ipmid/message.hpp>
+#include <phosphor-logging/lg2.hpp>
+#include <phosphor-logging/log.hpp>
+#include <user_channel/channel_layer.hpp>
+
+#include <algorithm>
+#include <cstdint>
+#include <exception>
 #include <memory>
 #include <optional>
-#include <phosphor-logging/log.hpp>
+#include <stdexcept>
 #include <tuple>
-#include <user_channel/channel_layer.hpp>
 #include <utility>
 
 #ifdef ALLOW_DEPRECATED_API
@@ -38,20 +43,55 @@ namespace ipmi
 {
 
 template <typename... Args>
-static inline message::Response::ptr
-    errorResponse(message::Request::ptr request, ipmi::Cc cc, Args&&... args)
+static inline message::Response::ptr errorResponse(
+    message::Request::ptr request, ipmi::Cc cc, Args&&... args)
 {
     message::Response::ptr response = request->makeResponse();
     response->cc = cc;
     response->pack(args...);
     return response;
 }
-static inline message::Response::ptr
-    errorResponse(message::Request::ptr request, ipmi::Cc cc)
+static inline message::Response::ptr errorResponse(
+    message::Request::ptr request, ipmi::Cc cc)
 {
     message::Response::ptr response = request->makeResponse();
     response->cc = cc;
     return response;
+}
+
+/** @brief Exception extension that allows setting an IPMI return code */
+class HandlerCompletion
+{
+  public:
+    HandlerCompletion(Cc cc) noexcept : cc(cc) {}
+
+    Cc code() const noexcept
+    {
+        return cc;
+    }
+
+  private:
+    Cc cc;
+};
+
+/** @brief Exception extension that allows setting an IPMI return code and
+ * printing out a logged error */
+class HandlerException : public HandlerCompletion, public std::runtime_error
+{
+  public:
+    HandlerException(Cc cc, const char* what) :
+        HandlerCompletion(cc), std::runtime_error(what)
+    {}
+    HandlerException(Cc cc, const std::string& what) :
+        HandlerException(cc, what.c_str())
+    {}
+};
+
+static inline const char* currentExceptionType()
+{
+    int status;
+    return abi::__cxa_demangle(abi::__cxa_current_exception_type()->name(),
+                               nullptr, nullptr, &status);
 }
 
 /**
@@ -64,6 +104,8 @@ class HandlerBase
 {
   public:
     using ptr = std::shared_ptr<HandlerBase>;
+
+    virtual ~HandlerBase() = default;
 
     /** @brief wrap the call to the registered handler with the request
      *
@@ -99,8 +141,8 @@ class HandlerBase
      *
      * @return a shared_ptr to a Response object
      */
-    virtual message::Response::ptr
-        executeCallback(message::Request::ptr request) = 0;
+    virtual message::Response::ptr executeCallback(
+        message::Request::ptr request) = 0;
 };
 
 /**
@@ -117,8 +159,7 @@ class IpmiHandler final : public HandlerBase
   public:
     explicit IpmiHandler(Handler&& handler) :
         handler_(std::forward<Handler>(handler))
-    {
-    }
+    {}
 
   private:
     Handler handler_;
@@ -140,8 +181,8 @@ class IpmiHandler final : public HandlerBase
      *
      * @return a shared_ptr to a Response object
      */
-    message::Response::ptr
-        executeCallback(message::Request::ptr request) override
+    message::Response::ptr executeCallback(
+        message::Request::ptr request) override
     {
         message::Response::ptr response = request->makeResponse();
 
@@ -152,7 +193,7 @@ class IpmiHandler final : public HandlerBase
             InputArgsType>::type;
         using ResultType = boost::callable_traits::return_type_t<Handler>;
 
-        UnpackArgsType unpackArgs;
+        UnpackArgsType unpackArgs{};
         request->payload.trailingOk = false;
         ipmi::Cc unpackError = request->unpack(unpackArgs);
         if (unpackError != ipmi::ccSuccess)
@@ -224,35 +265,34 @@ class IpmiHandler final : public HandlerBase
             // ipmi::RspType<>
             result = std::apply(handler_, *inputArgs);
         }
+        catch (const HandlerException& e)
+        {
+            lg2::info("Handler produced exception, NetFn: {NETFN}, "
+                      "Cmd: {CMD}: {ERROR}",
+                      "NETFN", lg2::hex, request->ctx->netFn, "CMD", lg2::hex,
+                      request->ctx->cmd, "ERROR", e);
+            return errorResponse(request, e.code());
+        }
         catch (const std::exception& e)
         {
-            phosphor::logging::log<phosphor::logging::level::ERR>(
-                "Handler failed to catch exception",
-                phosphor::logging::entry("EXCEPTION=%s", e.what()),
-                phosphor::logging::entry("NETFN=%x", request->ctx->netFn),
-                phosphor::logging::entry("CMD=%x", request->ctx->cmd));
+            lg2::error("Handler failed to catch exception, NetFn: {NETFN}, "
+                       "Cmd: {CMD}: {ERROR}",
+                       "NETFN", lg2::hex, request->ctx->netFn, "CMD", lg2::hex,
+                       request->ctx->cmd, "ERROR", e);
             return errorResponse(request, ccUnspecifiedError);
+        }
+        catch (const HandlerCompletion& c)
+        {
+            return errorResponse(request, c.code());
         }
         catch (...)
         {
-            std::exception_ptr eptr;
-            try
-            {
-                eptr = std::current_exception();
-                if (eptr)
-                {
-                    std::rethrow_exception(eptr);
-                }
-            }
-            catch (const std::exception& e)
-            {
-                phosphor::logging::log<phosphor::logging::level::ERR>(
-                    "Handler failed to catch exception",
-                    phosphor::logging::entry("EXCEPTION=%s", e.what()),
-                    phosphor::logging::entry("NETFN=%x", request->ctx->netFn),
-                    phosphor::logging::entry("CMD=%x", request->ctx->cmd));
-                return errorResponse(request, ccUnspecifiedError);
-            }
+            const char* what = currentExceptionType();
+            lg2::error("Handler failed to catch exception, NetFn: {NETFN}, "
+                       "Cmd: {CMD}: {ERROR}",
+                       "NETFN", lg2::hex, request->ctx->netFn, "CMD", lg2::hex,
+                       request->ctx->cmd, "ERROR", what);
+            return errorResponse(request, ccUnspecifiedError);
         }
 
         response->cc = std::get<0>(result);
@@ -284,8 +324,7 @@ class IpmiHandler<ipmid_callback_t> final : public HandlerBase
   public:
     explicit IpmiHandler(const ipmid_callback_t& handler, void* ctx = nullptr) :
         handler_(handler), handlerCtx(ctx)
-    {
-    }
+    {}
 
   private:
     ipmid_callback_t handler_;
@@ -307,8 +346,8 @@ class IpmiHandler<ipmid_callback_t> final : public HandlerBase
      *
      * @return a shared_ptr to a Response object
      */
-    message::Response::ptr
-        executeCallback(message::Request::ptr request) override
+    message::Response::ptr executeCallback(
+        message::Request::ptr request) override
     {
         message::Response::ptr response = request->makeResponse();
         // allocate a big response buffer here
@@ -323,35 +362,34 @@ class IpmiHandler<ipmid_callback_t> final : public HandlerBase
                          request->payload.data() + request->payload.rawIndex,
                          response->payload.data(), &len, handlerCtx);
         }
+        catch (const HandlerException& e)
+        {
+            lg2::info("Legacy Handler produced exception, NetFn: {NETFN}, "
+                      "Cmd: {CMD}: {ERROR}",
+                      "NETFN", lg2::hex, request->ctx->netFn, "CMD", lg2::hex,
+                      request->ctx->cmd, "ERROR", e);
+            return errorResponse(request, e.code());
+        }
         catch (const std::exception& e)
         {
-            phosphor::logging::log<phosphor::logging::level::ERR>(
-                "Legacy Handler failed to catch exception",
-                phosphor::logging::entry("EXCEPTION=%s", e.what()),
-                phosphor::logging::entry("NETFN=%x", request->ctx->netFn),
-                phosphor::logging::entry("CMD=%x", request->ctx->cmd));
+            lg2::error("Legacy Handler failed to catch exception, "
+                       "NetFn: {NETFN}, Cmd: {CMD}: {ERROR}",
+                       "NETFN", lg2::hex, request->ctx->netFn, "CMD", lg2::hex,
+                       request->ctx->cmd, "ERROR", e);
             return errorResponse(request, ccUnspecifiedError);
+        }
+        catch (const HandlerCompletion& c)
+        {
+            return errorResponse(request, c.code());
         }
         catch (...)
         {
-            std::exception_ptr eptr;
-            try
-            {
-                eptr = std::current_exception();
-                if (eptr)
-                {
-                    std::rethrow_exception(eptr);
-                }
-            }
-            catch (const std::exception& e)
-            {
-                phosphor::logging::log<phosphor::logging::level::ERR>(
-                    "Handler failed to catch exception",
-                    phosphor::logging::entry("EXCEPTION=%s", e.what()),
-                    phosphor::logging::entry("NETFN=%x", request->ctx->netFn),
-                    phosphor::logging::entry("CMD=%x", request->ctx->cmd));
-                return errorResponse(request, ccUnspecifiedError);
-            }
+            const char* what = currentExceptionType();
+            lg2::error("Handler failed to catch exception, NetFn: {NETFN}, "
+                       "Cmd: {CMD}: {ERROR}",
+                       "NETFN", lg2::hex, request->ctx->netFn, "CMD", lg2::hex,
+                       request->ctx->cmd, "ERROR", what);
+            return errorResponse(request, ccUnspecifiedError);
         }
         response->cc = ccRet;
         response->payload.resize(len);
@@ -373,9 +411,7 @@ template <>
 class IpmiHandler<oem::Handler> final : public HandlerBase
 {
   public:
-    explicit IpmiHandler(const oem::Handler& handler) : handler_(handler)
-    {
-    }
+    explicit IpmiHandler(const oem::Handler& handler) : handler_(handler) {}
 
   private:
     oem::Handler handler_;
@@ -396,8 +432,8 @@ class IpmiHandler<oem::Handler> final : public HandlerBase
      *
      * @return a shared_ptr to a Response object
      */
-    message::Response::ptr
-        executeCallback(message::Request::ptr request) override
+    message::Response::ptr executeCallback(
+        message::Request::ptr request) override
     {
         message::Response::ptr response = request->makeResponse();
         // allocate a big response buffer here
@@ -412,35 +448,34 @@ class IpmiHandler<oem::Handler> final : public HandlerBase
                          request->payload.data() + request->payload.rawIndex,
                          response->payload.data(), &len);
         }
+        catch (const HandlerException& e)
+        {
+            lg2::info("Legacy OEM Handler produced exception, NetFn: {NETFN}, "
+                      "Cmd: {CMD}: {ERROR}",
+                      "NETFN", lg2::hex, request->ctx->netFn, "CMD", lg2::hex,
+                      request->ctx->cmd, "ERROR", e);
+            return errorResponse(request, e.code());
+        }
         catch (const std::exception& e)
         {
-            phosphor::logging::log<phosphor::logging::level::ERR>(
-                "Legacy OEM Handler failed to catch exception",
-                phosphor::logging::entry("EXCEPTION=%s", e.what()),
-                phosphor::logging::entry("NETFN=%x", request->ctx->netFn),
-                phosphor::logging::entry("CMD=%x", request->ctx->cmd));
+            lg2::error("Legacy OEM Handler failed to catch exception, "
+                       "NetFn: {NETFN}, Cmd: {CMD}: {ERROR}",
+                       "NETFN", lg2::hex, request->ctx->netFn, "CMD", lg2::hex,
+                       request->ctx->cmd, "ERROR", e);
             return errorResponse(request, ccUnspecifiedError);
+        }
+        catch (const HandlerCompletion& c)
+        {
+            return errorResponse(request, c.code());
         }
         catch (...)
         {
-            std::exception_ptr eptr;
-            try
-            {
-                eptr = std::current_exception();
-                if (eptr)
-                {
-                    std::rethrow_exception(eptr);
-                }
-            }
-            catch (const std::exception& e)
-            {
-                phosphor::logging::log<phosphor::logging::level::ERR>(
-                    "Handler failed to catch exception",
-                    phosphor::logging::entry("EXCEPTION=%s", e.what()),
-                    phosphor::logging::entry("NETFN=%x", request->ctx->netFn),
-                    phosphor::logging::entry("CMD=%x", request->ctx->cmd));
-                return errorResponse(request, ccUnspecifiedError);
-            }
+            const char* what = currentExceptionType();
+            lg2::error("Legacy failed to catch exception, NetFn: {NETFN}, "
+                       "Cmd: {CMD}: {ERROR}",
+                       "NETFN", lg2::hex, request->ctx->netFn, "CMD", lg2::hex,
+                       request->ctx->cmd, "ERROR", what);
+            return errorResponse(request, ccUnspecifiedError);
         }
         response->cc = ccRet;
         response->payload.resize(len);
@@ -531,7 +566,7 @@ bool registerOemHandler(int prio, Iana iana, Cmd cmd, Privilege priv,
  * @param prio - priority at which to register; see api.hpp
  * @param netFn - the IPMI net function number to register
  * @param cmd - the IPMI command number to register
- * @param priv - the IPMI user privilige required for this command
+ * @param priv - the IPMI user privilege required for this command
  * @param handler - the callback function that will handle this request
  *
  * @return bool - success of registering the handler
@@ -569,7 +604,7 @@ bool registerHandler(int prio, NetFn netFn, Cmd cmd, Privilege priv,
  * @param prio - priority at which to register; see api.hpp
  * @param netFn - the IPMI net function number to register
  * @param cmd - the IPMI command number to register
- * @param priv - the IPMI user privilige required for this command
+ * @param priv - the IPMI user privilege required for this command
  * @param handler - the callback function that will handle this request
  *
  * @return bool - success of registering the handler
@@ -604,7 +639,7 @@ void registerGroupHandler(int prio, Group group, Cmd cmd, Privilege priv,
  * @param prio - priority at which to register; see api.hpp
  * @param netFn - the IPMI net function number to register
  * @param cmd - the IPMI command number to register
- * @param priv - the IPMI user privilige required for this command
+ * @param priv - the IPMI user privilege required for this command
  * @param handler - the callback function that will handle this request
  *
  * @return bool - success of registering the handler
@@ -632,7 +667,7 @@ void registerOemHandler(int prio, Iana iana, Cmd cmd, Privilege priv,
  * @param cmd - the IPMI command number to register
  * @param context - ignored
  * @param handler - the callback function that will handle this request
- * @param priv - the IPMI user privilige required for this command
+ * @param priv - the IPMI user privilege required for this command
  */
 // [[deprecated("Use ipmi::registerHandler() instead")]]
 void ipmi_register_callback(ipmi_netfn_t netFn, ipmi_cmd_t cmd,

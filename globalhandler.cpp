@@ -1,50 +1,40 @@
-#include "globalhandler.hpp"
-
 #include <ipmid/api.hpp>
 #include <ipmid/utils.hpp>
-#include <phosphor-logging/elog-errors.hpp>
-#include <phosphor-logging/log.hpp>
-#include <string>
-#include <xyz/openbmc_project/Common/error.hpp>
+#include <phosphor-logging/lg2.hpp>
 #include <xyz/openbmc_project/State/BMC/server.hpp>
 
-static constexpr auto bmcStateRoot = "/xyz/openbmc_project/state";
-static constexpr auto bmcStateIntf = "xyz.openbmc_project.State.BMC";
-static constexpr auto reqTransition = "RequestedBMCTransition";
-static constexpr auto match = "bmc0";
+#include <string>
 
-using namespace phosphor::logging;
-using BMC = sdbusplus::xyz::openbmc_project::State::server::BMC;
+using BMCState = sdbusplus::server::xyz::openbmc_project::state::BMC;
 
-void register_netfn_global_functions() __attribute__((constructor));
-
-void resetBMC()
-{
-    sdbusplus::bus::bus bus{ipmid_get_sd_bus_connection()};
-
-    auto bmcStateObj =
-        ipmi::getDbusObject(bus, bmcStateIntf, bmcStateRoot, match);
-
-    auto service = ipmi::getService(bus, bmcStateIntf, bmcStateObj.first);
-
-    ipmi::setDbusProperty(bus, service, bmcStateObj.first, bmcStateIntf,
-                          reqTransition,
-                          convertForMessage(BMC::Transition::Reboot));
-}
+void registerNetFnGlobalFunctions() __attribute__((constructor));
 
 /** @brief implements cold and warm reset commands
  *  @param - None
  *  @returns IPMI completion code.
  */
-ipmi::RspType<> ipmiGlobalReset()
+ipmi::RspType<> ipmiGlobalReset(ipmi::Context::ptr ctx)
 {
-    try
+    ipmi::DbusObjectInfo bmcStateObj;
+    boost::system::error_code ec = ipmi::getDbusObject(
+        ctx, BMCState::interface, BMCState::namespace_path::value,
+        BMCState::namespace_path::bmc, bmcStateObj);
+    if (!ec)
     {
-        resetBMC();
+        std::string service;
+        ec = ipmi::getService(ctx, BMCState::interface, bmcStateObj.first,
+                              service);
+        if (!ec)
+        {
+            ec = ipmi::setDbusProperty(
+                ctx, service, bmcStateObj.first, BMCState::interface,
+                BMCState::property_names::requested_bmc_transition,
+                convertForMessage(BMCState::Transition::Reboot));
+        }
     }
-    catch (std::exception& e)
+    if (ec)
     {
-        log<level::ERR>(e.what());
+        lg2::error("Exception in Global Reset: {ERROR}", "ERROR", ec.message());
         return ipmi::responseUnspecifiedError();
     }
 
@@ -52,9 +42,8 @@ ipmi::RspType<> ipmiGlobalReset()
     return ipmi::responseSuccess();
 }
 
-void register_netfn_global_functions()
+void registerNetFnGlobalFunctions()
 {
-
     // Cold Reset
     ipmi::registerHandler(ipmi::prioOpenBmcBase, ipmi::netFnApp,
                           ipmi::app::cmdColdReset, ipmi::Privilege::Admin,

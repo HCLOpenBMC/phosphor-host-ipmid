@@ -4,21 +4,32 @@
 
 #include <endian.h>
 
-#include <bitset>
-#include <cstdint>
 #include <ipmid/api.hpp>
 #include <phosphor-logging/elog-errors.hpp>
 #include <phosphor-logging/elog.hpp>
-#include <phosphor-logging/log.hpp>
-#include <string>
+#include <phosphor-logging/lg2.hpp>
 #include <xyz/openbmc_project/Common/error.hpp>
+
+#include <bitset>
+#include <cstdint>
+#include <string>
 
 using phosphor::logging::commit;
 using phosphor::logging::level;
 using phosphor::logging::log;
-using sdbusplus::xyz::openbmc_project::Common::Error::InternalFailure;
+using sdbusplus::error::xyz::openbmc_project::common::InternalFailure;
 
 static bool lastCallSuccessful = false;
+
+namespace ipmi
+{
+constexpr Cc ccWatchdogNotInit = 0x80;
+
+static inline auto responseWatchdogNotInit()
+{
+    return response(ccWatchdogNotInit);
+}
+} // namespace ipmi
 
 void reportError()
 {
@@ -43,20 +54,19 @@ ipmi::RspType<> ipmiAppResetWatchdogTimer()
 {
     try
     {
-        WatchdogService wd_service;
+        WatchdogService wdService;
 
         // Notify the caller if we haven't initialized our timer yet
         // so it can configure actions and timeouts
-        if (!wd_service.getInitialized())
+        if (!wdService.getInitialized())
         {
             lastCallSuccessful = true;
 
-            constexpr uint8_t ccWatchdogNotInit = 0x80;
-            return ipmi::response(ccWatchdogNotInit);
+            return ipmi::responseWatchdogNotInit();
         }
 
         // The ipmi standard dictates we enable the watchdog during reset
-        wd_service.resetTimeRemaining(true);
+        wdService.resetTimeRemaining(true);
         lastCallSuccessful = true;
         return ipmi::responseSuccess();
     }
@@ -67,19 +77,17 @@ ipmi::RspType<> ipmiAppResetWatchdogTimer()
     }
     catch (const std::exception& e)
     {
-        const std::string e_str = std::string("wd_reset: ") + e.what();
-        log<level::ERR>(e_str.c_str());
+        lg2::error("wd_reset: {ERROR}", "ERROR", e);
         return ipmi::responseUnspecifiedError();
     }
     catch (...)
     {
-        log<level::ERR>("wd_reset: Unknown Error");
+        lg2::error("wd_reset: Unknown Error");
         return ipmi::responseUnspecifiedError();
     }
 }
 
-static constexpr uint8_t wd_dont_stop = 0x1 << 6;
-static constexpr uint8_t wd_timeout_action_mask = 0x3;
+static constexpr uint8_t wdTimeoutActionMask = 0x3;
 
 static constexpr uint8_t wdTimerUseResTimer1 = 0x0;
 static constexpr uint8_t wdTimerUseResTimer2 = 0x6;
@@ -97,12 +105,12 @@ enum class IpmiAction : uint8_t
 };
 
 /** @brief Converts an IPMI Watchdog Action to DBUS defined action
- *  @param[in] ipmi_action The IPMI Watchdog Action
- *  @return The Watchdog Action that the ipmi_action maps to
+ *  @param[in] ipmiAction The IPMI Watchdog Action
+ *  @return The Watchdog Action that the ipmiAction maps to
  */
-WatchdogService::Action ipmiActionToWdAction(IpmiAction ipmi_action)
+WatchdogService::Action ipmiActionToWdAction(IpmiAction ipmiAction)
 {
-    switch (ipmi_action)
+    switch (ipmiAction)
     {
         case IpmiAction::None:
         {
@@ -192,12 +200,11 @@ static constexpr uint8_t wdExpirationFlagReservedBit7 = 0x7;
  *
  * @return completion code on success.
  **/
-ipmi::RspType<>
-    ipmiSetWatchdogTimer(uint3_t timerUse, uint3_t reserved, bool dontStopTimer,
-                         bool dontLog, uint3_t timeoutAction, uint1_t reserved1,
-                         uint3_t preTimeoutInterrupt, uint1_t reserved2,
-                         uint8_t preTimeoutInterval,
-                         std::bitset<8> expFlagValue, uint16_t initialCountdown)
+ipmi::RspType<> ipmiSetWatchdogTimer(
+    uint3_t timerUse, uint3_t reserved, bool dontStopTimer, bool dontLog,
+    uint3_t timeoutAction, uint1_t reserved1, uint3_t preTimeoutInterrupt,
+    uint1_t reserved2, uint8_t preTimeoutInterval, std::bitset<8> expFlagValue,
+    uint16_t initialCountdown)
 {
     if ((timerUse == wdTimerUseResTimer1) ||
         (timerUse == wdTimerUseResTimer2) ||
@@ -222,33 +229,33 @@ ipmi::RspType<>
 
     try
     {
-        WatchdogService wd_service;
+        WatchdogService wdService;
         // Stop the timer if the don't stop bit is not set
         if (!(dontStopTimer))
         {
-            wd_service.setEnabled(false);
+            wdService.setEnabled(false);
         }
 
         // Set the action based on the request
-        const auto ipmi_action = static_cast<IpmiAction>(
-            static_cast<uint8_t>(timeoutAction) & wd_timeout_action_mask);
-        wd_service.setExpireAction(ipmiActionToWdAction(ipmi_action));
+        const auto ipmiAction = static_cast<IpmiAction>(
+            static_cast<uint8_t>(timeoutAction) & wdTimeoutActionMask);
+        wdService.setExpireAction(ipmiActionToWdAction(ipmiAction));
 
-        const auto ipmiTimerUse =
-            static_cast<IpmiTimerUse>(static_cast<uint8_t>(timerUse));
-        wd_service.setTimerUse(ipmiTimerUseToWdTimerUse(ipmiTimerUse));
+        const auto ipmiTimerUse = types::enum_cast<IpmiTimerUse>(timerUse);
+        wdService.setTimerUse(ipmiTimerUseToWdTimerUse(ipmiTimerUse));
 
-        wd_service.setExpiredTimerUse(WatchdogService::TimerUse::Reserved);
+        wdService.setExpiredTimerUse(WatchdogService::TimerUse::Reserved);
 
         timerUseExpirationFlags &= ~expFlagValue;
 
         // Set the new interval and the time remaining deci -> mill seconds
         const uint64_t interval = initialCountdown * 100;
-        wd_service.setInterval(interval);
-        wd_service.resetTimeRemaining(false);
+        wdService.setInterval(interval);
+        wdService.resetTimeRemaining(false);
 
         // Mark as initialized so that future resets behave correctly
-        wd_service.setInitialized(true);
+        wdService.setInitialized(true);
+        wdService.setLogTimeout(!dontLog);
 
         lastCallSuccessful = true;
         return ipmi::responseSuccess();
@@ -264,24 +271,23 @@ ipmi::RspType<>
     }
     catch (const std::exception& e)
     {
-        const std::string e_str = std::string("wd_set: ") + e.what();
-        log<level::ERR>(e_str.c_str());
+        lg2::error("wd_set: {ERROR}", "ERROR", e);
         return ipmi::responseUnspecifiedError();
     }
     catch (...)
     {
-        log<level::ERR>("wd_set: Unknown Error");
+        lg2::error("wd_set: Unknown Error");
         return ipmi::responseUnspecifiedError();
     }
 }
 
 /** @brief Converts a DBUS Watchdog Action to IPMI defined action
- *  @param[in] wd_action The DBUS Watchdog Action
- *  @return The IpmiAction that the wd_action maps to
+ *  @param[in] wdAction The DBUS Watchdog Action
+ *  @return The IpmiAction that the wdAction maps to
  */
-IpmiAction wdActionToIpmiAction(WatchdogService::Action wd_action)
+IpmiAction wdActionToIpmiAction(WatchdogService::Action wdAction)
 {
-    switch (wd_action)
+    switch (wdAction)
     {
         case WatchdogService::Action::None:
         {
@@ -345,8 +351,6 @@ IpmiTimerUse wdTimerUseToIpmiTimerUse(WatchdogService::TimerUse wdTimerUse)
     }
 }
 
-static constexpr uint8_t wd_running = 0x1 << 6;
-
 /**@brief The getWatchdogTimer ipmi command.
  *
  * @return Completion code plus timer details.
@@ -357,15 +361,15 @@ static constexpr uint8_t wd_running = 0x1 << 6;
  * - initialCountdown
  * - presentCountdown
  **/
-ipmi::RspType<uint3_t, // timerUse - timer use
-              uint3_t, // timerUse - reserved
-              bool,    // timerUse - timer is started
-              bool,    // timerUse - don't log
+ipmi::RspType<uint3_t,        // timerUse - timer use
+              uint3_t,        // timerUse - reserved
+              bool,           // timerUse - timer is started
+              bool,           // timerUse - don't log
 
-              uint3_t, // timerAction - timeout action
-              uint1_t, // timerAction - reserved
-              uint3_t, // timerAction - pre-timeout interrupt
-              uint1_t, // timerAction - reserved
+              uint3_t,        // timerAction - timeout action
+              uint1_t,        // timerAction - reserved
+              uint3_t,        // timerAction - pre-timeout interrupt
+              uint1_t,        // timerAction - reserved
 
               uint8_t,        // pretimeout
               std::bitset<8>, // expireFlags
@@ -379,26 +383,26 @@ ipmi::RspType<uint3_t, // timerUse - timer use
 
     try
     {
-        WatchdogService wd_service;
-        WatchdogService::Properties wd_prop = wd_service.getProperties();
+        WatchdogService wdService;
+        WatchdogService::Properties wdProp = wdService.getProperties();
 
         // Build and return the response
         // Interval and timeRemaining need converted from milli -> deci seconds
-        uint16_t initialCountdown = htole16(wd_prop.interval / 100);
+        uint16_t initialCountdown = htole16(wdProp.interval / 100);
 
-        if (wd_prop.expiredTimerUse != WatchdogService::TimerUse::Reserved)
+        if (wdProp.expiredTimerUse != WatchdogService::TimerUse::Reserved)
         {
             timerUseExpirationFlags.set(static_cast<uint8_t>(
-                wdTimerUseToIpmiTimerUse(wd_prop.expiredTimerUse)));
+                wdTimerUseToIpmiTimerUse(wdProp.expiredTimerUse)));
         }
 
-        if (wd_prop.enabled)
+        if (wdProp.enabled)
         {
-            presentCountdown = htole16(wd_prop.timeRemaining / 100);
+            presentCountdown = htole16(wdProp.timeRemaining / 100);
         }
         else
         {
-            if (wd_prop.expiredTimerUse == WatchdogService::TimerUse::Reserved)
+            if (wdProp.expiredTimerUse == WatchdogService::TimerUse::Reserved)
             {
                 presentCountdown = initialCountdown;
             }
@@ -415,10 +419,12 @@ ipmi::RspType<uint3_t, // timerUse - timer use
 
         lastCallSuccessful = true;
         return ipmi::responseSuccess(
-            static_cast<uint3_t>(wdTimerUseToIpmiTimerUse(wd_prop.timerUse)), 0,
-            wd_prop.enabled, timerNotLogFlags,
-            static_cast<uint3_t>(wdActionToIpmiAction(wd_prop.expireAction)), 0,
-            timerPreTimeoutInterrupt, 0, pretimeout, timerUseExpirationFlags,
+            types::enum_cast<uint3_t>(
+                wdTimerUseToIpmiTimerUse(wdProp.timerUse)),
+            0, wdProp.enabled, timerNotLogFlags,
+            types::enum_cast<uint3_t>(
+                wdActionToIpmiAction(wdProp.expireAction)),
+            0, timerPreTimeoutInterrupt, 0, pretimeout, timerUseExpirationFlags,
             initialCountdown, presentCountdown);
     }
     catch (const InternalFailure& e)
@@ -428,13 +434,12 @@ ipmi::RspType<uint3_t, // timerUse - timer use
     }
     catch (const std::exception& e)
     {
-        const std::string e_str = std::string("wd_get: ") + e.what();
-        log<level::ERR>(e_str.c_str());
+        lg2::error("wd_get: {ERROR}", "ERROR", e);
         return ipmi::responseUnspecifiedError();
     }
     catch (...)
     {
-        log<level::ERR>("wd_get: Unknown Error");
+        lg2::error("wd_get: Unknown Error");
         return ipmi::responseUnspecifiedError();
     }
 }

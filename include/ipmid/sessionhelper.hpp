@@ -1,10 +1,13 @@
+#pragma once
+
+#include <cstdint>
 #include <sstream>
 #include <string>
 
 /**
  * @brief parse session input payload.
  *
- * This function retrives the session id and session handle from the session
+ * This function retrieves the session id and session handle from the session
  * object path.
  * A valid object path will be in the form
  * "/xyz/openbmc_project/ipmi/session/channel/sessionId_sessionHandle"
@@ -14,10 +17,10 @@
  * SessionHandle: 0X8a
 
  * @param[in] objectPath - session object path
- * @param[in] sessionId - retrived session id will be asigned.
- * @param[in] sessionHandle - retrived session handle will be asigned.
+ * @param[in] sessionId - retrieved session id will be assigned.
+ * @param[in] sessionHandle - retrieved session handle will be assigned.
  *
- * @return true if session id and session handle are retrived else returns
+ * @return true if session id and session handle are retrieved else returns
  * false.
  */
 bool parseCloseSessionInputPayload(const std::string& objectPath,
@@ -30,7 +33,6 @@ bool parseCloseSessionInputPayload(const std::string& objectPath,
     // getting the position of session id and session handle string from
     // object path.
     std::size_t ptrPosition = objectPath.rfind("/");
-    uint16_t tempSessionHandle = 0;
 
     if (ptrPosition != std::string::npos)
     {
@@ -44,10 +46,11 @@ bool parseCloseSessionInputPayload(const std::string& objectPath,
             // extracting the session handle
             std::string sessionHandleString = sessionIdString.substr(pos + 1);
             // extracting the session id
-            sessionIdString = sessionIdString.substr(0, pos);
+            sessionIdString.resize(pos);
             // converting session id string  and session handle string to
             // hexadecimal.
             std::stringstream handle(sessionHandleString);
+            uint16_t tempSessionHandle = 0;
             handle >> std::hex >> tempSessionHandle;
             sessionHandle = tempSessionHandle & 0xFF;
             std::stringstream idString(sessionIdString);
@@ -71,7 +74,7 @@ bool parseCloseSessionInputPayload(const std::string& objectPath,
  *
  * @return true if the object is matched else return false
  **/
-bool isSessionObjectMatched(const std::string objectPath,
+bool isSessionObjectMatched(const std::string& objectPath,
                             const uint32_t reqSessionId,
                             const uint8_t reqSessionHandle)
 {

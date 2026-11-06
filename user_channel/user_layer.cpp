@@ -33,7 +33,7 @@ Cc ipmiUserInit()
     return ccSuccess;
 }
 
-std::string ipmiUserGetPassword(const std::string& userName)
+SecureString ipmiUserGetPassword(const std::string& userName)
 {
     return passwdMgr.getPasswdByUserName(userName);
 }
@@ -74,13 +74,16 @@ uint8_t ipmiUserGetUserId(const std::string& userName)
 
 Cc ipmiUserSetUserName(const uint8_t userId, const char* userName)
 {
-    std::string newUser(userName, 0, ipmiMaxUserName);
+    size_t len = strnlen(userName, ipmiMaxUserName);
+    std::string newUser(userName, len);
     return getUserAccessObject().setUserName(userId, newUser);
 }
 
 Cc ipmiUserSetUserName(const uint8_t userId, const std::string& userName)
 {
-    std::string newUser(userName, 0, ipmiMaxUserName);
+    size_t len =
+        std::min(userName.size(), static_cast<size_t>(ipmiMaxUserName));
+    std::string newUser(userName, 0, len);
     return getUserAccessObject().setUserName(userId, newUser);
 }
 
@@ -95,7 +98,7 @@ Cc ipmiUserSetUserPassword(const uint8_t userId, const char* userPassword)
 }
 
 Cc ipmiSetSpecialUserPassword(const std::string& userName,
-                              const std::string& userPassword)
+                              const SecureString& userPassword)
 {
     return getUserAccessObject().setSpecialUserPassword(userName, userPassword);
 }
@@ -138,12 +141,51 @@ Cc ipmiUserCheckEnabled(const uint8_t userId, bool& state)
     return ccSuccess;
 }
 
+namespace
+{
+Cc getUserBoolProperty(const std::string& userName,
+                       const std::string& propertyName, bool& value)
+{
+    sdbusplus::bus_t bus(ipmid_get_sd_bus_connection());
+    std::string userPath = std::string(userObjBasePath) + "/" + userName;
+    try
+    {
+        auto method = bus.new_method_call(userMgrService, userPath.c_str(),
+                                          dBusPropertiesInterface, "Get");
+        method.append(usersInterface, propertyName);
+        auto reply = bus.call(method);
+        std::variant<bool> variantValue;
+        reply.read(variantValue);
+        value = std::get<bool>(variantValue);
+    }
+    catch (const sdbusplus::exception_t& e)
+    {
+        lg2::error("Failed to get {PROP} for user: {USER}, error: {ERROR}",
+                   "PROP", propertyName, "USER", userName, "ERROR", e.what());
+        return ccUnspecifiedError;
+    }
+    return ccSuccess;
+}
+} // namespace
+
+Cc ipmiUserCheckLockedForFailedAttempt(const std::string& userName,
+                                       bool& locked)
+{
+    return getUserBoolProperty(userName, "UserLockedForFailedAttempt", locked);
+}
+
+Cc ipmiUserCheckPasswordExpired(const std::string& userName, bool& expired)
+{
+    return getUserBoolProperty(userName, "UserPasswordExpired", expired);
+}
+
 Cc ipmiUserGetPrivilegeAccess(const uint8_t userId, const uint8_t chNum,
                               PrivAccess& privAccess)
 {
-
     if (!UserAccess::isValidChannel(chNum))
     {
+        lg2::error("Get Privilege access - Invalid channel number: {CHANNEL}",
+                   "CHANNEL", chNum);
         return ccInvalidFieldRequest;
     }
     if (!UserAccess::isValidUserId(userId))
@@ -175,19 +217,15 @@ Cc ipmiUserSetPrivilegeAccess(const uint8_t userId, const uint8_t chNum,
         userId, chNum, userPrivAccess, otherPrivUpdates);
 }
 
-bool ipmiUserPamAuthenticate(std::string_view userName,
-                             std::string_view userPassword)
-{
-    return pamUserCheckAuthenticate(userName, userPassword);
-}
-
 Cc ipmiUserSetUserPayloadAccess(const uint8_t chNum, const uint8_t operation,
                                 const uint8_t userId,
                                 const PayloadAccess& payloadAccess)
 {
-
     if (!UserAccess::isValidChannel(chNum))
     {
+        lg2::error(
+            "Set user payload access - Invalid channel number: {CHANNEL}",
+            "CHANNEL", chNum);
         return ccInvalidFieldRequest;
     }
     if (!UserAccess::isValidUserId(userId))
@@ -202,9 +240,11 @@ Cc ipmiUserSetUserPayloadAccess(const uint8_t chNum, const uint8_t operation,
 Cc ipmiUserGetUserPayloadAccess(const uint8_t chNum, const uint8_t userId,
                                 PayloadAccess& payloadAccess)
 {
-
     if (!UserAccess::isValidChannel(chNum))
     {
+        lg2::error(
+            "Get user payload access - Invalid channel number: {CHANNEL}",
+            "CHANNEL", chNum);
         return ccInvalidFieldRequest;
     }
     if (!UserAccess::isValidUserId(userId))
@@ -224,6 +264,22 @@ Cc ipmiUserGetUserPayloadAccess(const uint8_t chNum, const uint8_t userId,
         userInfo->payloadAccess[chNum].oemPayloadEnables2Reserved;
 
     return ccSuccess;
+}
+
+Cc ipmiUserSetUserGroups(const uint8_t userId, const uint8_t chNum,
+                         const std::vector<std::string>& groupAccess)
+{
+    if (!UserAccess::isValidUserId(userId))
+    {
+        return ccParmOutOfRange;
+    }
+
+    if (!UserAccess::isValidChannel(chNum))
+    {
+        return ccInvalidFieldRequest;
+    }
+
+    return getUserAccessObject().setUserGroups(userId, chNum, groupAccess);
 }
 
 } // namespace ipmi

@@ -20,10 +20,11 @@
 
 #include <boost/interprocess/sync/file_lock.hpp>
 #include <boost/interprocess/sync/named_recursive_mutex.hpp>
-#include <cstdint>
-#include <ctime>
 #include <nlohmann/json.hpp>
 #include <sdbusplus/bus.hpp>
+
+#include <cstdint>
+#include <ctime>
 #include <variant>
 
 namespace ipmi
@@ -37,7 +38,7 @@ using DbusChObjProperties = std::vector<std::pair<std::string, DbusVariant>>;
 
 static constexpr const char* ipmiChannelMutex = "ipmi_channel_mutex";
 static constexpr const char* ipmiChMutexCleanupLockFile =
-    "/var/lib/ipmi/ipmi_channel_mutex_cleanup";
+    "/run/ipmi/ipmi_channel_mutex_cleanup";
 
 /** @struct ChannelAccessData
  *
@@ -64,6 +65,7 @@ struct ChannelProperties
     ChannelInfo chInfo;
     ChannelAccessData chAccess;
     size_t maxTransferSize;
+    bool isManagementNIC;
 };
 
 class ChannelConfig;
@@ -130,7 +132,7 @@ class ChannelConfig
      *
      *  @param[in] chNum - channel number
      *
-     *  @return numer of active sessions
+     *  @return number of active sessions
      */
     int getChannelActiveSessions(const uint8_t chNum);
 
@@ -215,7 +217,7 @@ class ChannelConfig
     Cc getChannelEnabledAuthType(const uint8_t chNum, const uint8_t priv,
                                  EAuthType& authType);
 
-    /** @brief conver to channel privilege from system privilege
+    /** @brief convert to channel privilege from system privilege
      *
      *  @param[in] value - privilege value
      *
@@ -235,6 +237,14 @@ class ChannelConfig
      */
     int writeChannelVolatileData();
 
+    /** @brief Returns the IPMI channel ID authorized to push IPMI privilege
+     * changes to phosphor-user-manager. Any channel access changes made on
+     * any other channel are ignored.
+     *
+     *  @return IPMI channel ID as defined in channel_config.json
+     */
+    uint8_t getManagementNICID();
+
   private:
     uint32_t signalFlag = 0;
     std::unique_ptr<boost::interprocess::named_recursive_mutex> channelMutex{
@@ -243,7 +253,7 @@ class ChannelConfig
     std::time_t nvFileLastUpdatedTime;
     std::time_t voltFileLastUpdatedTime;
     boost::interprocess::file_lock mutexCleanupLock;
-    sdbusplus::bus::bus bus;
+    sdbusplus::bus_t bus;
     bool signalHndlrObjectState = false;
     boost::interprocess::file_lock sigHndlrLock;
 
@@ -312,20 +322,6 @@ class ChannelConfig
                         const std::string& interface,
                         const std::string& property, const DbusVariant& value);
 
-    /** @brief function to get D-Bus property value
-     *
-     *  @param[in] service - service name
-     *  @param[in] objPath - object path
-     *  @param[in] interface - interface
-     *  @param[in] property - property name
-     *  @param[out] value - property value
-     *
-     *  @return 0 for success, -errno for failure.
-     */
-    int getDbusProperty(const std::string& service, const std::string& objPath,
-                        const std::string& interface,
-                        const std::string& property, DbusVariant& value);
-
     /** @brief function to read json config file
      *
      *  @param[in] configFile - configuration file name
@@ -354,7 +350,7 @@ class ChannelConfig
 
     /** @brief function to convert access mode value to string
      *
-     *  @param[in] value - acess mode value
+     *  @param[in] value - access mode value
      *
      *  @return access mode in string
      */
@@ -374,8 +370,8 @@ class ChannelConfig
      *
      *  @return support session type
      */
-    EChannelSessSupported
-        convertToSessionSupportIndex(const std::string& value);
+    EChannelSessSupported convertToSessionSupportIndex(
+        const std::string& value);
 
     /** @brief function to convert medium type string to value type
      *
@@ -389,7 +385,7 @@ class ChannelConfig
      *
      *  @param[in] value - protocol type in string
      *
-     *  @return channel protocol  type
+     *  @return channel protocol type
      */
     EChannelProtocolType convertToProtocolTypeIndex(const std::string& value);
 

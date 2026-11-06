@@ -16,6 +16,8 @@
 #pragma once
 #include <openssl/evp.h>
 
+#include <ipmid/types.hpp>
+
 #include <ctime>
 #include <string>
 #include <unordered_map>
@@ -45,9 +47,9 @@ class PasswdMgr
      * @return password string. will return empty string, if unable to locate
      * the user
      */
-    std::string getPasswdByUserName(const std::string& userName);
+    SecureString getPasswdByUserName(const std::string& userName);
 
-    /** @brief Update / clear  username and password entry for the specified
+    /** @brief Update / clear username and password entry for the specified
      * user
      *
      *  @param[in] userName - user name that has to be renamed / deleted
@@ -61,7 +63,7 @@ class PasswdMgr
 
   private:
     using UserName = std::string;
-    using Password = std::string;
+    using Password = SecureString;
     std::unordered_map<UserName, Password> passwdMapList;
     std::time_t fileLastUpdatedTime;
 
@@ -87,7 +89,7 @@ class PasswdMgr
      *
      * @return error response
      */
-    int readPasswdFileData(std::vector<uint8_t>& outBytes);
+    int readPasswdFileData(SecureString& outBytes);
     /** @brief  Updates special password file by clearing the password entry
      *  for the user specified.
      *
@@ -112,15 +114,14 @@ class PasswdMgr
      *  @param[in] mac - message authentication code - to figure out corruption
      *  @param[in] macLen - size of MAC
      *  @param[in] outBytes - ptr to store output bytes
-     *  @param[in] outBytesLen - outbut data length.
+     *  @param[in] outBytesLen - output data length.
      *
      * @return error response
      */
-    int encryptDecryptData(bool doEncrypt, const EVP_CIPHER* cipher,
-                           uint8_t* key, size_t keyLen, uint8_t* iv,
-                           size_t ivLen, uint8_t* inBytes, size_t inBytesLen,
-                           uint8_t* mac, size_t* macLen, uint8_t* outBytes,
-                           size_t* outBytesLen);
+    int encryptDecryptData(
+        bool doEncrypt, const EVP_CIPHER* cipher, uint8_t* key, size_t keyLen,
+        uint8_t* iv, size_t ivLen, uint8_t* inBytes, size_t inBytesLen,
+        uint8_t* mac, size_t* macLen, uint8_t* outBytes, size_t* outBytesLen);
 
     /** @brief  returns updated file time of passwd file entry.
      *

@@ -15,9 +15,12 @@
 */
 #pragma once
 
-#include <bitset>
 #include <ipmid/api.hpp>
+#include <ipmid/types.hpp>
+
+#include <bitset>
 #include <string>
+#include <vector>
 
 namespace ipmi
 {
@@ -48,18 +51,18 @@ static constexpr uint8_t payloadsPerByte = 8;
 struct PrivAccess
 {
 #if BYTE_ORDER == LITTLE_ENDIAN
-    uint8_t privilege : 4;
-    uint8_t ipmiEnabled : 1;
-    uint8_t linkAuthEnabled : 1;
-    uint8_t accessCallback : 1;
-    uint8_t reserved : 1;
+    uint8_t privilege:4;
+    uint8_t ipmiEnabled:1;
+    uint8_t linkAuthEnabled:1;
+    uint8_t accessCallback:1;
+    uint8_t reserved:1;
 #endif
 #if BYTE_ORDER == BIG_ENDIAN
-    uint8_t reserved : 1;
-    uint8_t accessCallback : 1;
-    uint8_t linkAuthEnabled : 1;
-    uint8_t ipmiEnabled : 1;
-    uint8_t privilege : 4;
+    uint8_t reserved:1;
+    uint8_t accessCallback:1;
+    uint8_t linkAuthEnabled:1;
+    uint8_t ipmiEnabled:1;
+    uint8_t privilege:4;
 #endif
 } __attribute__((packed));
 
@@ -88,7 +91,7 @@ Cc ipmiUserInit();
  *
  *  @return password or empty string
  */
-std::string ipmiUserGetPassword(const std::string& userName);
+SecureString ipmiUserGetPassword(const std::string& userName);
 
 /** @brief The IPMI call to clear password entry associated with specified
  * username
@@ -166,7 +169,7 @@ Cc ipmiUserSetUserPassword(const uint8_t userId, const char* userPassword);
  *  @return ccSuccess for success, others for failure.
  */
 Cc ipmiSetSpecialUserPassword(const std::string& userName,
-                              const std::string& userPassword);
+                              const SecureString& userPassword);
 
 /** @brief get user name
  *
@@ -206,6 +209,25 @@ Cc ipmiUserUpdateEnabledState(const uint8_t userId, const bool& state);
  */
 Cc ipmiUserCheckEnabled(const uint8_t userId, bool& state);
 
+/** @brief determines whether user is locked for failed login attempts
+ *
+ *  @param[in] userName - user name
+ *  @param[out] locked  - true if locked, false otherwise
+ *
+ *  @return ccSuccess for success, others for failure.
+ */
+Cc ipmiUserCheckLockedForFailedAttempt(const std::string& userName,
+                                       bool& locked);
+
+/** @brief determines whether user's password has expired
+ *
+ *  @param[in] userName - user name
+ *  @param[out] expired - true if password has expired, false otherwise
+ *
+ *  @return ccSuccess for success, others for failure.
+ */
+Cc ipmiUserCheckPasswordExpired(const std::string& userName, bool& expired);
+
 /** @brief provides user privilege access data
  *
  *  @param[in] userId - user id
@@ -230,17 +252,6 @@ Cc ipmiUserSetPrivilegeAccess(const uint8_t userId, const uint8_t chNum,
                               const PrivAccess& privAccess,
                               const bool& otherPrivUpdate);
 
-/** @brief check for user pam authentication. This is to determine, whether user
- * is already locked out for failed login attempt
- *
- *  @param[in] username - username
- *  @param[in] password - password
- *
- *  @return status
- */
-bool ipmiUserPamAuthenticate(std::string_view userName,
-                             std::string_view userPassword);
-
 /** @brief sets user payload access data
  *
  *  @param[in] chNum - channel number
@@ -264,5 +275,16 @@ Cc ipmiUserSetUserPayloadAccess(const uint8_t chNum, const uint8_t operation,
  */
 Cc ipmiUserGetUserPayloadAccess(const uint8_t chNum, const uint8_t userId,
                                 PayloadAccess& payloadAccess);
+
+/** @brief sets user group access data
+ *
+ *  @param[in] userId - user id
+ *  @param[in] chNum - channel number
+ *  @param[in] groups - groups data
+ *
+ *  @return ccSuccess for success, others for failure.
+ */
+Cc ipmiUserSetUserGroups(const uint8_t userId, const uint8_t chNum,
+                         const std::vector<std::string>& groupAccess);
 
 } // namespace ipmi

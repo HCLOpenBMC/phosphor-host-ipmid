@@ -2,15 +2,14 @@
 
 #include "sensorhandler.hpp"
 
-#include <bitset>
-#include <filesystem>
 #include <ipmid/types.hpp>
 #include <ipmid/utils.hpp>
-#include <optional>
-#include <phosphor-logging/elog-errors.hpp>
-#include <phosphor-logging/log.hpp>
 #include <sdbusplus/message/types.hpp>
 #include <xyz/openbmc_project/Common/error.hpp>
+
+#include <bitset>
+#include <filesystem>
+#include <optional>
 
 namespace ipmi
 {
@@ -19,64 +18,7 @@ namespace sensor
 
 using namespace phosphor::logging;
 using InternalFailure =
-    sdbusplus::xyz::openbmc_project::Common::Error::InternalFailure;
-
-static constexpr auto MAPPER_BUSNAME = "xyz.openbmc_project.ObjectMapper";
-static constexpr auto MAPPER_PATH = "/xyz/openbmc_project/object_mapper";
-static constexpr auto MAPPER_INTERFACE = "xyz.openbmc_project.ObjectMapper";
-
-/** @brief get the D-Bus service and service path
- *  @param[in] bus - The Dbus bus object
- *  @param[in] interface - interface to the service
- *  @param[in] path - interested path in the list of objects
- *  @return pair of service path and service
- */
-ServicePath getServiceAndPath(sdbusplus::bus::bus& bus,
-                              const std::string& interface,
-                              const std::string& path)
-{
-    auto depth = 0;
-    auto mapperCall = bus.new_method_call(MAPPER_BUSNAME, MAPPER_PATH,
-                                          MAPPER_INTERFACE, "GetSubTree");
-    mapperCall.append("/");
-    mapperCall.append(depth);
-    mapperCall.append(std::vector<Interface>({interface}));
-
-    auto mapperResponseMsg = bus.call(mapperCall);
-    if (mapperResponseMsg.is_method_error())
-    {
-        log<level::ERR>("Mapper GetSubTree failed",
-                        entry("PATH=%s", path.c_str()),
-                        entry("INTERFACE=%s", interface.c_str()));
-        elog<InternalFailure>();
-    }
-
-    MapperResponseType mapperResponse;
-    mapperResponseMsg.read(mapperResponse);
-    if (mapperResponse.empty())
-    {
-        log<level::ERR>("Invalid mapper response",
-                        entry("PATH=%s", path.c_str()),
-                        entry("INTERFACE=%s", interface.c_str()));
-        elog<InternalFailure>();
-    }
-
-    if (path.empty())
-    {
-        // Get the first one if the path is not in list.
-        return std::make_pair(mapperResponse.begin()->first,
-                              mapperResponse.begin()->second.begin()->first);
-    }
-    const auto& iter = mapperResponse.find(path);
-    if (iter == mapperResponse.end())
-    {
-        log<level::ERR>("Couldn't find D-Bus path",
-                        entry("PATH=%s", path.c_str()),
-                        entry("INTERFACE=%s", interface.c_str()));
-        elog<InternalFailure>();
-    }
-    return std::make_pair(iter->first, iter->second.begin()->first);
-}
+    sdbusplus::error::xyz::openbmc_project::common::InternalFailure;
 
 AssertionSet getAssertionSet(const SetSensorReadingReq& cmdData)
 {
@@ -89,24 +31,20 @@ AssertionSet getAssertionSet(const SetSensorReadingReq& cmdData)
     return std::make_pair(assertionStates, deassertionStates);
 }
 
-ipmi_ret_t updateToDbus(IpmiUpdateData& msg)
+ipmi::Cc updateToDbus(IpmiUpdateData& msg)
 {
-    sdbusplus::bus::bus bus{ipmid_get_sd_bus_connection()};
+    sdbusplus::bus_t bus{ipmid_get_sd_bus_connection()};
     try
     {
         auto serviceResponseMsg = bus.call(msg);
-        if (serviceResponseMsg.is_method_error())
-        {
-            log<level::ERR>("Error in D-Bus call");
-            return IPMI_CC_UNSPECIFIED_ERROR;
-        }
     }
-    catch (InternalFailure& e)
+    catch (const InternalFailure& e)
     {
+        lg2::error("Error in D-Bus call: {ERROR}", "ERROR", e);
         commit<InternalFailure>();
-        return IPMI_CC_UNSPECIFIED_ERROR;
+        return ipmi::ccUnspecifiedError;
     }
-    return IPMI_CC_OK;
+    return ipmi::ccSuccess;
 }
 
 namespace get
@@ -130,29 +68,40 @@ GetSensorResponse mapDbusToAssertion(const Info& sensorInfo,
                                      const InstancePath& path,
                                      const DbusInterface& interface)
 {
-    sdbusplus::bus::bus bus{ipmid_get_sd_bus_connection()};
+    sdbusplus::bus_t bus{ipmid_get_sd_bus_connection()};
     GetSensorResponse response{};
 
-    enableScanning(&response);
+    enableScanning(response);
 
     auto service = ipmi::getService(bus, interface, path);
 
     const auto& interfaceList = sensorInfo.propertyInterfaces;
 
-    for (const auto& interface : interfaceList)
+    for (const auto& [intf, propertyMap] : interfaceList)
     {
-        for (const auto& property : interface.second)
+        for (const auto& [property, values] : propertyMap)
         {
-            auto propValue = ipmi::getDbusProperty(
-                bus, service, path, interface.first, property.first);
-
-            for (const auto& value : std::get<OffsetValueMap>(property.second))
+            try
             {
-                if (propValue == value.second.assert)
+                auto propValue =
+                    ipmi::getDbusProperty(bus, service, path, intf, property);
+
+                for (const auto& value : std::get<OffsetValueMap>(values))
                 {
-                    setOffset(value.first, &response);
-                    break;
+                    if (propValue == value.second.assert)
+                    {
+                        setOffset(value.first, response);
+                        break;
+                    }
                 }
+            }
+            catch (const std::exception& e)
+            {
+                lg2::error(
+                    "mapDbusToAssertion: Failed to get property, service: {SERVICE},"
+                    " path: {PATH}, interface: {INTERFACE}, property name: {PRONAME}: {ERROR}",
+                    "SERVICE", service, "PATH", path, "INTERFACE", intf,
+                    "PRONAME", property, "ERROR", e);
             }
         }
     }
@@ -160,6 +109,51 @@ GetSensorResponse mapDbusToAssertion(const Info& sensorInfo,
     return response;
 }
 
+GetSensorResponse mapDbusToEventdata2(const Info& sensorInfo)
+{
+    sdbusplus::bus_t bus{ipmid_get_sd_bus_connection()};
+    GetSensorResponse response{};
+
+    enableScanning(response);
+
+    auto service = ipmi::getService(bus, sensorInfo.sensorInterface,
+                                    sensorInfo.sensorPath);
+
+    const auto& interfaceList = sensorInfo.propertyInterfaces;
+
+    for (const auto& [intf, propertyMap] : interfaceList)
+    {
+        for (const auto& [property, values] : propertyMap)
+        {
+            try
+            {
+                auto propValue = ipmi::getDbusProperty(
+                    bus, service, sensorInfo.sensorPath, intf, property);
+
+                for (const auto& value : std::get<OffsetValueMap>(values))
+                {
+                    if (propValue == value.second.assert)
+                    {
+                        setReading(value.first, response);
+                        break;
+                    }
+                }
+            }
+            catch (const std::exception& e)
+            {
+                lg2::error(
+                    "mapDbusToEventdata2: Failed to get property, service: {SERVICE},"
+                    " path: {PATH}, interface: {INTERFACE}, property name: {PRONAME}: {ERROR}",
+                    "SERVICE", service, "PATH", sensorInfo.sensorPath,
+                    "INTERFACE", intf, "PRONAME", property, "ERROR", e);
+            }
+        }
+    }
+
+    return response;
+}
+
+#ifndef FEATURE_SENSORS_CACHE
 GetSensorResponse assertion(const Info& sensorInfo)
 {
     return mapDbusToAssertion(sensorInfo, sensorInfo.sensorPath,
@@ -168,37 +162,41 @@ GetSensorResponse assertion(const Info& sensorInfo)
 
 GetSensorResponse eventdata2(const Info& sensorInfo)
 {
-    sdbusplus::bus::bus bus{ipmid_get_sd_bus_connection()};
-    GetSensorResponse response{};
+    return mapDbusToEventdata2(sensorInfo);
+}
+#else
+std::optional<GetSensorResponse> assertion(uint8_t id, const Info& sensorInfo,
+                                           const PropertyMap& /*properties*/)
+{
+    // The assertion may contain multiple properties
+    // So we have to get the properties from DBus anyway
+    auto response = mapDbusToAssertion(sensorInfo, sensorInfo.sensorPath,
+                                       sensorInfo.sensorInterface);
 
-    enableScanning(&response);
-
-    auto service = ipmi::getService(bus, sensorInfo.sensorInterface,
-                                    sensorInfo.sensorPath);
-
-    const auto& interfaceList = sensorInfo.propertyInterfaces;
-
-    for (const auto& interface : interfaceList)
+    if (!sensorCacheMap[id].has_value())
     {
-        for (const auto& property : interface.second)
-        {
-            auto propValue =
-                ipmi::getDbusProperty(bus, service, sensorInfo.sensorPath,
-                                      interface.first, property.first);
-
-            for (const auto& value : std::get<OffsetValueMap>(property.second))
-            {
-                if (propValue == value.second.assert)
-                {
-                    setReading(value.first, &response);
-                    break;
-                }
-            }
-        }
+        sensorCacheMap[id] = SensorData{};
     }
-
+    sensorCacheMap[id]->response = response;
     return response;
 }
+
+std::optional<GetSensorResponse> eventdata2(uint8_t id, const Info& sensorInfo,
+                                            const PropertyMap& /*properties*/)
+{
+    // The eventdata2 may contain multiple properties
+    // So we have to get the properties from DBus anyway
+    auto response = mapDbusToEventdata2(sensorInfo);
+
+    if (!sensorCacheMap[id].has_value())
+    {
+        sensorCacheMap[id] = SensorData{};
+    }
+    sensorCacheMap[id]->response = response;
+    return response;
+}
+
+#endif // FEATURE_SENSORS_CACHE
 
 } // namespace get
 
@@ -210,7 +208,7 @@ IpmiUpdateData makeDbusMsg(const std::string& updateInterface,
                            const std::string& command,
                            const std::string& sensorInterface)
 {
-    sdbusplus::bus::bus bus{ipmid_get_sd_bus_connection()};
+    sdbusplus::bus_t bus{ipmid_get_sd_bus_connection()};
     using namespace std::string_literals;
 
     auto dbusService = getService(bus, sensorInterface, sensorPath);
@@ -219,8 +217,8 @@ IpmiUpdateData makeDbusMsg(const std::string& updateInterface,
                                updateInterface.c_str(), command.c_str());
 }
 
-ipmi_ret_t eventdata(const SetSensorReadingReq& cmdData, const Info& sensorInfo,
-                     uint8_t data)
+ipmi::Cc eventdata(const SetSensorReadingReq&, const Info& sensorInfo,
+                   uint8_t data)
 {
     auto msg =
         makeDbusMsg("org.freedesktop.DBus.Properties", sensorInfo.sensorPath,
@@ -234,15 +232,15 @@ ipmi_ret_t eventdata(const SetSensorReadingReq& cmdData, const Info& sensorInfo,
         const auto& iter = std::get<OffsetValueMap>(property.second).find(data);
         if (iter == std::get<OffsetValueMap>(property.second).end())
         {
-            log<level::ERR>("Invalid event data");
-            return IPMI_CC_PARM_OUT_OF_RANGE;
+            lg2::error("Invalid event data");
+            return ipmi::ccParmOutOfRange;
         }
         msg.append(iter->second.assert);
     }
     return updateToDbus(msg);
 }
 
-ipmi_ret_t assertion(const SetSensorReadingReq& cmdData, const Info& sensorInfo)
+ipmi::Cc assertion(const SetSensorReadingReq& cmdData, const Info& sensorInfo)
 {
     std::bitset<16> assertionSet(getAssertionSet(cmdData).first);
     std::bitset<16> deassertionSet(getAssertionSet(cmdData).second);
@@ -290,7 +288,7 @@ ipmi_ret_t assertion(const SetSensorReadingReq& cmdData, const Info& sensorInfo)
         }
     }
 
-    return IPMI_CC_OK;
+    return ipmi::ccSuccess;
 }
 
 } // namespace set
@@ -299,11 +297,10 @@ namespace notify
 {
 
 IpmiUpdateData makeDbusMsg(const std::string& updateInterface,
-                           const std::string& sensorPath,
-                           const std::string& command,
-                           const std::string& sensorInterface)
+                           const std::string&, const std::string& command,
+                           const std::string&)
 {
-    sdbusplus::bus::bus bus{ipmid_get_sd_bus_connection()};
+    sdbusplus::bus_t bus{ipmid_get_sd_bus_connection()};
     using namespace std::string_literals;
 
     static const auto dbusPath = "/xyz/openbmc_project/inventory"s;
@@ -313,7 +310,7 @@ IpmiUpdateData makeDbusMsg(const std::string& updateInterface,
                                updateInterface.c_str(), command.c_str());
 }
 
-ipmi_ret_t assertion(const SetSensorReadingReq& cmdData, const Info& sensorInfo)
+ipmi::Cc assertion(const SetSensorReadingReq& cmdData, const Info& sensorInfo)
 {
     auto msg = makeDbusMsg(sensorInfo.sensorInterface, sensorInfo.sensorPath,
                            "Notify", sensorInfo.sensorInterface);
@@ -347,7 +344,7 @@ ipmi_ret_t assertion(const SetSensorReadingReq& cmdData, const Info& sensorInfo)
                     // Skip update if skipOn is ASSERT
                     if (SkipAssertion::ASSERT == value.second.skip)
                     {
-                        return IPMI_CC_OK;
+                        return ipmi::ccSuccess;
                     }
                     result = result && std::get<bool>(value.second.assert);
                     valid = true;
@@ -357,7 +354,7 @@ ipmi_ret_t assertion(const SetSensorReadingReq& cmdData, const Info& sensorInfo)
                     // Skip update if skipOn is DEASSERT
                     if (SkipAssertion::DEASSERT == value.second.skip)
                     {
-                        return IPMI_CC_OK;
+                        return ipmi::ccSuccess;
                     }
                     result = result && std::get<bool>(value.second.deassert);
                     valid = true;
@@ -396,6 +393,8 @@ namespace inventory
 namespace get
 {
 
+#ifndef FEATURE_SENSORS_CACHE
+
 GetSensorResponse assertion(const Info& sensorInfo)
 {
     namespace fs = std::filesystem;
@@ -407,6 +406,32 @@ GetSensorResponse assertion(const Info& sensorInfo)
         sensorInfo, path.string(),
         sensorInfo.propertyInterfaces.begin()->first);
 }
+
+#else
+
+std::optional<GetSensorResponse> assertion(uint8_t id, const Info& sensorInfo,
+                                           const PropertyMap& /*properties*/)
+{
+    // The assertion may contain multiple properties
+    // So we have to get the properties from DBus anyway
+    namespace fs = std::filesystem;
+
+    fs::path path{ipmi::sensor::inventoryRoot};
+    path += sensorInfo.sensorPath;
+
+    auto response = ipmi::sensor::get::mapDbusToAssertion(
+        sensorInfo, path.string(),
+        sensorInfo.propertyInterfaces.begin()->first);
+
+    if (!sensorCacheMap[id].has_value())
+    {
+        sensorCacheMap[id] = SensorData{};
+    }
+    sensorCacheMap[id]->response = response;
+    return response;
+}
+
+#endif
 
 } // namespace get
 

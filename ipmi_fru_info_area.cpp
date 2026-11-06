@@ -1,11 +1,14 @@
 #include "ipmi_fru_info_area.hpp"
 
+#include <ipmid/utils.hpp>
+#include <phosphor-logging/elog.hpp>
+#include <phosphor-logging/lg2.hpp>
+
 #include <algorithm>
 #include <ctime>
 #include <iomanip>
 #include <map>
 #include <numeric>
-#include <phosphor-logging/elog.hpp>
 #include <sstream>
 
 namespace ipmi
@@ -37,7 +40,6 @@ static constexpr auto englishLanguageCode = 0x0;
 static constexpr auto typeLengthByteNull = 0x0;
 static constexpr auto endOfCustomFields = 0xC1;
 static constexpr auto commonHeaderFormatSize = 0x8; // size in bytes
-static constexpr auto manufacturingDateSize = 0x3;
 static constexpr auto areaSizeOffset = 0x1;
 static constexpr uint8_t typeASCII = 0xC0;
 static constexpr auto maxRecordAttributeValue = 0x3F;
@@ -137,15 +139,10 @@ void appendChassisType(const PropertyMap& propMap, FruAreaData& data)
     if (iter != propMap.end())
     {
         auto value = iter->second;
-        try
+        if (!ipmi::tryParse(value, chassisType))
         {
-            chassisType = std::stoi(value);
-        }
-        catch (std::exception& e)
-        {
-            log<level::ERR>("Could not parse chassis type",
-                            entry("VALUE=%s", value.c_str()),
-                            entry("ERROR=%s", e.what()));
+            lg2::error("Could not parse chassis type, value: {VALUE}", "VALUE",
+                       value);
             chassisType = 0;
         }
     }
@@ -176,7 +173,7 @@ void appendData(const Property& key, const PropertyMap& propMap,
 
         // 6 bits for length as per FRU spec v1.0
         // if length is greater then 63(2^6) bytes then trim the data to 63
-        // bytess.
+        // bytes.
         auto valueLength = (value.length() > maxRecordAttributeValue)
                                ? maxRecordAttributeValue
                                : value.length();
@@ -199,9 +196,9 @@ std::time_t timeStringToRaw(const std::string& input)
 {
     // TODO: For non-US region timestamps, pass in region information for the
     // FRU to avoid the month/day swap.
-    // 2017-02-24 - 13:59:00, Tue Nov 20 23:08:00 2018
-    static const std::vector<std::string> patterns = {"%Y-%m-%d - %H:%M:%S",
-                                                      "%a %b %d %H:%M:%S %Y"};
+    // 2017-02-24 - 13:59:00, Tue Nov 20 23:08:00 2018, 20251224T064200Z
+    static const std::vector<std::string> patterns = {
+        "%Y-%m-%d - %H:%M:%S", "%a %b %d %H:%M:%S %Y", "%Y%m%dT%H%M%SZ"};
 
     std::tm time = {};
 
@@ -215,7 +212,7 @@ std::time_t timeStringToRaw(const std::string& input)
         }
     }
 
-    return std::mktime(&time);
+    return timegm(&time);
 }
 
 /**

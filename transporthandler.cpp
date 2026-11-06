@@ -1,51 +1,22 @@
 #include "transporthandler.hpp"
 
-#include "app/channel.hpp"
-#include "user_channel/cipher_mgmt.hpp"
-
-#include <arpa/inet.h>
-#include <netinet/ether.h>
+#include <ipmid/utils.hpp>
+#include <org/freedesktop/DBus/Error/event.hpp>
+#include <phosphor-logging/lg2.hpp>
+#include <stdplus/net/addr/subnet.hpp>
+#include <stdplus/raw.hpp>
 
 #include <array>
-#include <bitset>
-#include <cinttypes>
-#include <cstdint>
-#include <cstring>
 #include <fstream>
-#include <functional>
-#include <ipmid/api.hpp>
-#include <ipmid/message.hpp>
-#include <ipmid/message/types.hpp>
-#include <ipmid/types.hpp>
-#include <ipmid/utils.hpp>
-#include <optional>
-#include <phosphor-logging/elog-errors.hpp>
-#include <phosphor-logging/elog.hpp>
-#include <phosphor-logging/log.hpp>
-#include <sdbusplus/bus.hpp>
-#include <sdbusplus/exception.hpp>
-#include <string>
-#include <string_view>
-#include <type_traits>
-#include <unordered_map>
-#include <unordered_set>
-#include <user_channel/channel_layer.hpp>
-#include <utility>
-#include <vector>
-#include <xyz/openbmc_project/Common/error.hpp>
-#include <xyz/openbmc_project/Network/EthernetInterface/server.hpp>
-#include <xyz/openbmc_project/Network/IP/server.hpp>
-#include <xyz/openbmc_project/Network/Neighbor/server.hpp>
 
-using phosphor::logging::commit;
 using phosphor::logging::elog;
-using phosphor::logging::entry;
-using phosphor::logging::level;
-using phosphor::logging::log;
-using sdbusplus::xyz::openbmc_project::Common::Error::InternalFailure;
-using sdbusplus::xyz::openbmc_project::Network::server::EthernetInterface;
-using sdbusplus::xyz::openbmc_project::Network::server::IP;
-using sdbusplus::xyz::openbmc_project::Network::server::Neighbor;
+using sdbusplus::error::org::freedesktop::d_bus::Error::UnknownObject;
+using sdbusplus::error::xyz::openbmc_project::common::InternalFailure;
+using sdbusplus::error::xyz::openbmc_project::common::InvalidArgument;
+using sdbusplus::error::xyz::openbmc_project::common::NotAllowed;
+using sdbusplus::server::xyz::openbmc_project::network::EthernetInterface;
+using sdbusplus::server::xyz::openbmc_project::network::IP;
+using sdbusplus::server::xyz::openbmc_project::network::Neighbor;
 
 namespace cipher
 {
@@ -57,14 +28,14 @@ std::vector<uint8_t> getCipherList()
     std::ifstream jsonFile(cipher::configFile);
     if (!jsonFile.is_open())
     {
-        log<level::ERR>("Channel Cipher suites file not found");
+        lg2::error("Channel Cipher suites file not found");
         elog<InternalFailure>();
     }
 
     auto data = Json::parse(jsonFile, nullptr, false);
     if (data.is_discarded())
     {
-        log<level::ERR>("Parsing channel cipher suites JSON failed");
+        lg2::error("Parsing channel cipher suites JSON failed");
         elog<InternalFailure>();
     }
 
@@ -85,49 +56,31 @@ namespace ipmi
 namespace transport
 {
 
-// D-Bus Network Daemon definitions
-constexpr auto PATH_ROOT = "/xyz/openbmc_project/network";
-constexpr auto PATH_SYSTEMCONFIG = "/xyz/openbmc_project/network/config";
+// LAN Handler specific response codes
+constexpr Cc ccParamNotSupported = 0x80;
+constexpr Cc ccParamSetLocked = 0x81;
+constexpr Cc ccParamReadOnly = 0x82;
+constexpr Cc ccWriteReadParameter = 0x82;
 
-constexpr auto INTF_SYSTEMCONFIG =
-    "xyz.openbmc_project.Network.SystemConfiguration";
-constexpr auto INTF_ETHERNET = "xyz.openbmc_project.Network.EthernetInterface";
-constexpr auto INTF_IP = "xyz.openbmc_project.Network.IP";
-constexpr auto INTF_IP_CREATE = "xyz.openbmc_project.Network.IP.Create";
-constexpr auto INTF_MAC = "xyz.openbmc_project.Network.MACAddress";
-constexpr auto INTF_NEIGHBOR = "xyz.openbmc_project.Network.Neighbor";
-constexpr auto INTF_NEIGHBOR_CREATE_STATIC =
-    "xyz.openbmc_project.Network.Neighbor.CreateStatic";
-constexpr auto INTF_VLAN = "xyz.openbmc_project.Network.VLAN";
-constexpr auto INTF_VLAN_CREATE = "xyz.openbmc_project.Network.VLAN.Create";
-
-/** @brief Generic paramters for different address families */
-template <int family>
-struct AddrFamily
+static inline auto responseParamNotSupported()
 {
-};
+    return response(ccParamNotSupported);
+}
 
-/** @brief Parameter specialization for IPv4 */
-template <>
-struct AddrFamily<AF_INET>
+static inline auto responseParamSetLocked()
 {
-    using addr = in_addr;
-    static constexpr auto protocol = IP::Protocol::IPv4;
-    static constexpr size_t maxStrLen = INET6_ADDRSTRLEN;
-    static constexpr uint8_t defaultPrefix = 32;
-    static constexpr char propertyGateway[] = "DefaultGateway";
-};
+    return response(ccParamSetLocked);
+}
 
-/** @brief Parameter specialization for IPv6 */
-template <>
-struct AddrFamily<AF_INET6>
+static inline auto responseParamReadOnly()
 {
-    using addr = in6_addr;
-    static constexpr auto protocol = IP::Protocol::IPv6;
-    static constexpr size_t maxStrLen = INET6_ADDRSTRLEN;
-    static constexpr uint8_t defaultPrefix = 128;
-    static constexpr char propertyGateway[] = "DefaultGateway6";
-};
+    return response(ccParamReadOnly);
+}
+
+static inline auto responseWriteReadParameter()
+{
+    return response(ccWriteReadParameter);
+}
 
 /** @brief Valid address origins for IPv4 */
 const std::unordered_set<IP::AddressOrigin> originsV4 = {
@@ -135,101 +88,21 @@ const std::unordered_set<IP::AddressOrigin> originsV4 = {
     IP::AddressOrigin::DHCP,
 };
 
-/** @brief Valid address origins for IPv6 */
-const std::unordered_set<IP::AddressOrigin> originsV6Static = {
-    IP::AddressOrigin::Static};
-const std::unordered_set<IP::AddressOrigin> originsV6Dynamic = {
-    IP::AddressOrigin::DHCP,
-    IP::AddressOrigin::SLAAC,
-};
-
-/** @brief Interface IP Address configuration parameters */
-template <int family>
-struct IfAddr
-{
-    std::string path;
-    typename AddrFamily<family>::addr address;
-    IP::AddressOrigin origin;
-    uint8_t prefix;
-};
-
-/** @brief Interface Neighbor configuration parameters */
-template <int family>
-struct IfNeigh
-{
-    std::string path;
-    typename AddrFamily<family>::addr ip;
-    ether_addr mac;
-};
-
 static constexpr uint8_t oemCmdStart = 192;
-static constexpr uint8_t oemCmdEnd = 255;
 
-/** @brief A trivial helper used to determine if two PODs are equal
- *
- *  @params[in] a - The first object to compare
- *  @params[in] b - The second object to compare
- *  @return True if the objects are the same bytewise
- */
-template <typename T>
-bool equal(const T& a, const T& b)
+// Checks if the ifname is part of the networkd path
+// This assumes the path came from the network subtree PATH_ROOT
+bool ifnameInPath(std::string_view ifname, std::string_view path)
 {
-    static_assert(std::is_trivially_copyable_v<T>);
-    return std::memcmp(&a, &b, sizeof(T)) == 0;
+    constexpr auto rs = PATH_ROOT.size() + 1; // ROOT + separator
+    const auto is = rs + ifname.size();       // ROOT + sep + ifname
+    return path.size() > rs && path.substr(rs).starts_with(ifname) &&
+           (path.size() == is || path[is] == '/' ||
+            path[is] == '_'); // handle VLAN IF uses '_' e.g.
+                              // /xyz/openbmc_project/network/eth0_2
 }
 
-/** @brief Copies bytes from an array into a trivially copyable container
- *
- *  @params[out] t     - The container receiving the data
- *  @params[in]  bytes - The data to copy
- */
-template <size_t N, typename T>
-void copyInto(T& t, const std::array<uint8_t, N>& bytes)
-{
-    static_assert(std::is_trivially_copyable_v<T>);
-    static_assert(N == sizeof(T));
-    std::memcpy(&t, bytes.data(), bytes.size());
-}
-
-/** @brief Gets a generic view of the bytes in the input container
- *
- *  @params[in] t - The data to reference
- *  @return A string_view referencing the bytes in the container
- */
-template <typename T>
-std::string_view dataRef(const T& t)
-{
-    static_assert(std::is_trivially_copyable_v<T>);
-    return {reinterpret_cast<const char*>(&t), sizeof(T)};
-}
-
-/** @brief The dbus parameters for the interface corresponding to a channel
- *         This helps reduce the number of mapper lookups we need for each
- *         query and simplifies finding the VLAN interface if needed.
- */
-struct ChannelParams
-{
-    /** @brief The channel ID */
-    int id;
-    /** @brief channel name for the interface */
-    std::string ifname;
-    /** @brief Name of the service on the bus */
-    std::string service;
-    /** @brief Lower level adapter path that is guaranteed to not be a VLAN */
-    std::string ifPath;
-    /** @brief Logical adapter path used for address assignment */
-    std::string logicalPath;
-};
-
-/** @brief Determines the ethernet interface name corresponding to a channel
- *         Tries to map a VLAN object first so that the address information
- *         is accurate. Otherwise it gets the standard ethernet interface.
- *
- *  @param[in] bus     - The bus object used for lookups
- *  @param[in] channel - The channel id corresponding to an ethernet interface
- *  @return Ethernet interface service and object path if it exists
- */
-std::optional<ChannelParams> maybeGetChannelParams(sdbusplus::bus::bus& bus,
+std::optional<ChannelParams> maybeGetChannelParams(sdbusplus::bus_t& bus,
                                                    uint8_t channel)
 {
     auto ifname = getChannelName(channel);
@@ -239,18 +112,14 @@ std::optional<ChannelParams> maybeGetChannelParams(sdbusplus::bus::bus& bus,
     }
 
     // Enumerate all VLAN + ETHERNET interfaces
-    auto req = bus.new_method_call(MAPPER_BUS_NAME, MAPPER_OBJ, MAPPER_INTF,
-                                   "GetSubTree");
-    req.append(PATH_ROOT, 0,
-               std::vector<std::string>{INTF_VLAN, INTF_ETHERNET});
-    auto reply = bus.call(req);
-    ObjectTree objs;
-    reply.read(objs);
+    std::vector<std::string> interfaces = {INTF_VLAN, INTF_ETHERNET};
+    ipmi::ObjectTree objs =
+        ipmi::getSubTree(bus, interfaces, std::string{PATH_ROOT});
 
     ChannelParams params;
     for (const auto& [path, impls] : objs)
     {
-        if (path.find(ifname) == path.npos)
+        if (!ifnameInPath(ifname, path))
         {
             continue;
         }
@@ -297,198 +166,36 @@ std::optional<ChannelParams> maybeGetChannelParams(sdbusplus::bus::bus& bus,
 
     params.id = channel;
     params.ifname = std::move(ifname);
-    return std::move(params);
+    return params;
 }
 
-/** @brief A trivial helper around maybeGetChannelParams() that throws an
- *         exception when it is unable to acquire parameters for the channel.
- *
- *  @param[in] bus     - The bus object used for lookups
- *  @param[in] channel - The channel id corresponding to an ethernet interface
- *  @return Ethernet interface service and object path
- */
-ChannelParams getChannelParams(sdbusplus::bus::bus& bus, uint8_t channel)
+ChannelParams getChannelParams(sdbusplus::bus_t& bus, uint8_t channel)
 {
     auto params = maybeGetChannelParams(bus, channel);
     if (!params)
     {
-        log<level::ERR>("Failed to get channel params",
-                        entry("CHANNEL=%" PRIu8, channel));
+        lg2::error("Failed to get channel params: {CHANNEL}", "CHANNEL",
+                   channel);
         elog<InternalFailure>();
     }
     return std::move(*params);
 }
 
-/** @brief Wraps the phosphor logging method to insert some additional metadata
- *
- *  @param[in] params - The parameters for the channel
- *  ...
+/** @brief Get / Set the Property value from phosphor-networkd EthernetInterface
  */
-template <auto level, typename... Args>
-auto logWithChannel(const ChannelParams& params, Args&&... args)
+template <typename T>
+static T getEthProp(sdbusplus::bus_t& bus, const ChannelParams& params,
+                    const std::string& prop)
 {
-    return log<level>(std::forward<Args>(args)...,
-                      entry("CHANNEL=%d", params.id),
-                      entry("IFNAME=%s", params.ifname.c_str()));
+    return std::get<T>(getDbusProperty(bus, params.service, params.logicalPath,
+                                       INTF_ETHERNET, prop));
 }
-template <auto level, typename... Args>
-auto logWithChannel(const std::optional<ChannelParams>& params, Args&&... args)
+template <typename T>
+static void setEthProp(sdbusplus::bus_t& bus, const ChannelParams& params,
+                       const std::string& prop, const T& t)
 {
-    if (params)
-    {
-        return logWithChannel<level>(*params, std::forward<Args>(args)...);
-    }
-    return log<level>(std::forward<Args>(args)...);
-}
-
-/** @brief Trivializes using parameter getter functions by providing a bus
- *         and channel parameters automatically.
- *
- *  @param[in] channel - The channel id corresponding to an ethernet interface
- *  ...
- */
-template <auto func, typename... Args>
-auto channelCall(uint8_t channel, Args&&... args)
-{
-    sdbusplus::bus::bus bus(ipmid_get_sd_bus_connection());
-    auto params = getChannelParams(bus, channel);
-    return std::invoke(func, bus, params, std::forward<Args>(args)...);
-}
-
-/** @brief Determines if the ethernet interface is using DHCP
- *
- *  @param[in] bus    - The bus object used for lookups
- *  @param[in] params - The parameters for the channel
- *  @return DHCPConf enumeration
- */
-EthernetInterface::DHCPConf getDHCPProperty(sdbusplus::bus::bus& bus,
-                                            const ChannelParams& params)
-{
-    std::string dhcpstr = std::get<std::string>(getDbusProperty(
-        bus, params.service, params.logicalPath, INTF_ETHERNET, "DHCPEnabled"));
-    return EthernetInterface::convertDHCPConfFromString(dhcpstr);
-}
-
-/** @brief Sets the DHCP v4 state on the given interface
- *
- *  @param[in] bus           - The bus object used for lookups
- *  @param[in] params        - The parameters for the channel
- *  @param[in] requestedDhcp - DHCP state to assign
- *                             (EthernetInterface::DHCPConf::none,
- *                              EthernetInterface::DHCPConf::v4,
- *                              EthernetInterface::DHCPConf::v6,
- *                              EthernetInterface::DHCPConf::both)
- */
-void setDHCPv4Property(sdbusplus::bus::bus& bus, const ChannelParams& params,
-                       const EthernetInterface::DHCPConf requestedDhcp)
-{
-    EthernetInterface::DHCPConf currentDhcp = getDHCPProperty(bus, params);
-    EthernetInterface::DHCPConf nextDhcp = EthernetInterface::DHCPConf::none;
-
-    if ((currentDhcp == EthernetInterface::DHCPConf::v6) &&
-        (requestedDhcp == EthernetInterface::DHCPConf::v4))
-    {
-        nextDhcp = EthernetInterface::DHCPConf::both;
-    }
-    else if ((currentDhcp == EthernetInterface::DHCPConf::none) &&
-             (requestedDhcp == EthernetInterface::DHCPConf::v4))
-
-    {
-        nextDhcp = requestedDhcp;
-    }
-    else if (requestedDhcp == EthernetInterface::DHCPConf::none)
-    {
-        if (currentDhcp == EthernetInterface::DHCPConf::both)
-        {
-            nextDhcp = EthernetInterface::DHCPConf::v6;
-        }
-        else if (currentDhcp == EthernetInterface::DHCPConf::v4)
-        {
-            nextDhcp = EthernetInterface::DHCPConf::none;
-        }
-    }
-    else
-    {
-        nextDhcp = currentDhcp;
-    }
-    std::string newDhcp =
-        sdbusplus::xyz::openbmc_project::Network::server::convertForMessage(
-            nextDhcp);
-    setDbusProperty(bus, params.service, params.logicalPath, INTF_ETHERNET,
-                    "DHCPEnabled", newDhcp);
-}
-
-/** @brief Sets the DHCP v6 state on the given interface
- *
- *  @param[in] bus           - The bus object used for lookups
- *  @param[in] params        - The parameters for the channel
- *  @param[in] requestedDhcp - DHCP state to assign (none, v6, both)
- *  @param[in] defaultMode   - True: Use algorithmic assignment
- *                             False: requestedDhcp assigned unconditionally
- */
-void setDHCPv6Property(sdbusplus::bus::bus& bus, const ChannelParams& params,
-                       const EthernetInterface::DHCPConf requestedDhcp,
-                       const bool defaultMode = true)
-{
-    EthernetInterface::DHCPConf currentDhcp = getDHCPProperty(bus, params);
-    EthernetInterface::DHCPConf nextDhcp = EthernetInterface::DHCPConf::none;
-
-    if (defaultMode)
-    {
-        if ((currentDhcp == EthernetInterface::DHCPConf::v4) &&
-            (requestedDhcp == EthernetInterface::DHCPConf::v6))
-        {
-            nextDhcp = EthernetInterface::DHCPConf::both;
-        }
-        else if ((currentDhcp == EthernetInterface::DHCPConf::none) &&
-                 (requestedDhcp == EthernetInterface::DHCPConf::v6))
-
-        {
-            nextDhcp = requestedDhcp;
-        }
-        else if (requestedDhcp == EthernetInterface::DHCPConf::none)
-        {
-            if (currentDhcp == EthernetInterface::DHCPConf::both)
-            {
-                nextDhcp = EthernetInterface::DHCPConf::v4;
-            }
-            else if (currentDhcp == EthernetInterface::DHCPConf::v6)
-            {
-                nextDhcp = EthernetInterface::DHCPConf::none;
-            }
-        }
-        else
-        {
-            nextDhcp = currentDhcp;
-        }
-    }
-    else
-    {
-        // allow the v6 call to set any value
-        nextDhcp = requestedDhcp;
-    }
-
-    std::string newDhcp =
-        sdbusplus::xyz::openbmc_project::Network::server::convertForMessage(
-            nextDhcp);
-    setDbusProperty(bus, params.service, params.logicalPath, INTF_ETHERNET,
-                    "DHCPEnabled", newDhcp);
-}
-
-/** @brief Converts a human readable MAC string into MAC bytes
- *
- *  @param[in] mac - The MAC string
- *  @return MAC in bytes
- */
-ether_addr stringToMAC(const char* mac)
-{
-    const ether_addr* ret = ether_aton(mac);
-    if (ret == nullptr)
-    {
-        log<level::ERR>("Invalid MAC Address", entry("MAC=%s", mac));
-        elog<InternalFailure>();
-    }
-    return *ret;
+    return setDbusProperty(bus, params.service, params.logicalPath,
+                           INTF_ETHERNET, prop, t);
 }
 
 /** @brief Determines the MAC of the ethernet interface
@@ -497,11 +204,12 @@ ether_addr stringToMAC(const char* mac)
  *  @param[in] params - The parameters for the channel
  *  @return The configured mac address
  */
-ether_addr getMACProperty(sdbusplus::bus::bus& bus, const ChannelParams& params)
+stdplus::EtherAddr getMACProperty(sdbusplus::bus_t& bus,
+                                  const ChannelParams& params)
 {
-    auto macStr = std::get<std::string>(getDbusProperty(
-        bus, params.service, params.ifPath, INTF_MAC, "MACAddress"));
-    return stringToMAC(macStr.c_str());
+    auto prop = getDbusProperty(bus, params.service, params.ifPath, INTF_MAC,
+                                "MACAddress");
+    return stdplus::fromStr<stdplus::EtherAddr>(std::get<std::string>(prop));
 }
 
 /** @brief Sets the system value for MAC address on the given interface
@@ -510,250 +218,15 @@ ether_addr getMACProperty(sdbusplus::bus::bus& bus, const ChannelParams& params)
  *  @param[in] params - The parameters for the channel
  *  @param[in] mac    - MAC address to apply
  */
-void setMACProperty(sdbusplus::bus::bus& bus, const ChannelParams& params,
-                    const ether_addr& mac)
+void setMACProperty(sdbusplus::bus_t& bus, const ChannelParams& params,
+                    stdplus::EtherAddr mac)
 {
-    std::string macStr = ether_ntoa(&mac);
+    std::string macStr = stdplus::toStr(mac);
     setDbusProperty(bus, params.service, params.ifPath, INTF_MAC, "MACAddress",
                     macStr);
 }
 
-/** @brief Turns an IP address string into the network byte order form
- *         NOTE: This version strictly validates family matches
- *
- *  @param[in] address - The string form of the address
- *  @return A network byte order address or none if conversion failed
- */
-template <int family>
-std::optional<typename AddrFamily<family>::addr>
-    maybeStringToAddr(const char* address)
-{
-    typename AddrFamily<family>::addr ret;
-    if (inet_pton(family, address, &ret) == 1)
-    {
-        return ret;
-    }
-    return std::nullopt;
-}
-
-/** @brief Turns an IP address string into the network byte order form
- *         NOTE: This version strictly validates family matches
- *
- *  @param[in] address - The string form of the address
- *  @return A network byte order address
- */
-template <int family>
-typename AddrFamily<family>::addr stringToAddr(const char* address)
-{
-    auto ret = maybeStringToAddr<family>(address);
-    if (!ret)
-    {
-        log<level::ERR>("Failed to convert IP Address",
-                        entry("FAMILY=%d", family),
-                        entry("ADDRESS=%s", address));
-        elog<InternalFailure>();
-    }
-    return *ret;
-}
-
-/** @brief Turns an IP address in network byte order into a string
- *
- *  @param[in] address - The string form of the address
- *  @return A network byte order address
- */
-template <int family>
-std::string addrToString(const typename AddrFamily<family>::addr& address)
-{
-    std::string ret(AddrFamily<family>::maxStrLen, '\0');
-    inet_ntop(family, &address, ret.data(), ret.size());
-    ret.resize(strlen(ret.c_str()));
-    return ret;
-}
-
-/** @brief Retrieves the current gateway for the address family on the system
- *         NOTE: The gateway is currently system wide and not per channel
- *
- *  @param[in] bus    - The bus object used for lookups
- *  @param[in] params - The parameters for the channel
- *  @return An address representing the gateway address if it exists
- */
-template <int family>
-std::optional<typename AddrFamily<family>::addr>
-    getGatewayProperty(sdbusplus::bus::bus& bus, const ChannelParams& params)
-{
-    auto gatewayStr = std::get<std::string>(getDbusProperty(
-        bus, params.service, PATH_SYSTEMCONFIG, INTF_SYSTEMCONFIG,
-        AddrFamily<family>::propertyGateway));
-    if (gatewayStr.empty())
-    {
-        return std::nullopt;
-    }
-    return stringToAddr<family>(gatewayStr.c_str());
-}
-
-/** @brief A lazy lookup mechanism for iterating over object properties stored
- *         in DBus. This will only perform the object lookup when needed, and
- *         retains a cache of previous lookups to speed up future iterations.
- */
-class ObjectLookupCache
-{
-  public:
-    using PropertiesCache = std::unordered_map<std::string, PropertyMap>;
-
-    /** @brief Creates a new ObjectLookupCache for the interface on the bus
-     *         NOTE: The inputs to this object must outlive the object since
-     *         they are only referenced by it.
-     *
-     *  @param[in] bus    - The bus object used for lookups
-     *  @param[in] params - The parameters for the channel
-     *  @param[in] intf   - The interface we are looking up
-     */
-    ObjectLookupCache(sdbusplus::bus::bus& bus, const ChannelParams& params,
-                      const char* intf) :
-        bus(bus),
-        params(params), intf(intf),
-        objs(getAllDbusObjects(bus, params.logicalPath, intf, ""))
-    {
-    }
-
-    class iterator : public ObjectTree::const_iterator
-    {
-      public:
-        using value_type = PropertiesCache::value_type;
-
-        iterator(ObjectTree::const_iterator it, ObjectLookupCache& container) :
-            ObjectTree::const_iterator(it), container(container),
-            ret(container.cache.end())
-        {
-        }
-        value_type& operator*()
-        {
-            ret = container.get(ObjectTree::const_iterator::operator*().first);
-            return *ret;
-        }
-        value_type* operator->()
-        {
-            return &operator*();
-        }
-
-      private:
-        ObjectLookupCache& container;
-        PropertiesCache::iterator ret;
-    };
-
-    iterator begin() noexcept
-    {
-        return iterator(objs.begin(), *this);
-    }
-
-    iterator end() noexcept
-    {
-        return iterator(objs.end(), *this);
-    }
-
-  private:
-    sdbusplus::bus::bus& bus;
-    const ChannelParams& params;
-    const char* const intf;
-    const ObjectTree objs;
-    PropertiesCache cache;
-
-    /** @brief Gets a cached copy of the object properties if possible
-     *         Otherwise performs a query on DBus to look them up
-     *
-     *  @param[in] path - The object path to lookup
-     *  @return An iterator for the specified object path + properties
-     */
-    PropertiesCache::iterator get(const std::string& path)
-    {
-        auto it = cache.find(path);
-        if (it != cache.end())
-        {
-            return it;
-        }
-        auto properties = getAllDbusProperties(bus, params.service, path, intf);
-        return cache.insert({path, std::move(properties)}).first;
-    }
-};
-
-/** @brief Searches the ip object lookup cache for an address matching
- *         the input parameters. NOTE: The index lacks stability across address
- *         changes since the network daemon has no notion of stable indicies.
- *
- *  @param[in] bus     - The bus object used for lookups
- *  @param[in] params  - The parameters for the channel
- *  @param[in] idx     - The index of the desired address on the interface
- *  @param[in] origins - The allowed origins for the address objects
- *  @param[in] ips     - The object lookup cache holding all of the address info
- *  @return The address and prefix if it was found
- */
-template <int family>
-std::optional<IfAddr<family>>
-    findIfAddr(sdbusplus::bus::bus& bus, const ChannelParams& params,
-               uint8_t idx,
-               const std::unordered_set<IP::AddressOrigin>& origins,
-               ObjectLookupCache& ips)
-{
-    for (const auto& [path, properties] : ips)
-    {
-        const auto& addrStr = std::get<std::string>(properties.at("Address"));
-        auto addr = maybeStringToAddr<family>(addrStr.c_str());
-        if (!addr)
-        {
-            continue;
-        }
-
-        IP::AddressOrigin origin = IP::convertAddressOriginFromString(
-            std::get<std::string>(properties.at("Origin")));
-        if (origins.find(origin) == origins.end())
-        {
-            continue;
-        }
-
-        if (idx > 0)
-        {
-            idx--;
-            continue;
-        }
-
-        IfAddr<family> ifaddr;
-        ifaddr.path = path;
-        ifaddr.address = *addr;
-        ifaddr.prefix = std::get<uint8_t>(properties.at("PrefixLength"));
-        ifaddr.origin = origin;
-        return std::move(ifaddr);
-    }
-
-    return std::nullopt;
-}
-
-/** @brief Trivial helper around findIfAddr that simplifies calls
- *         for one off lookups. Don't use this if you intend to do multiple
- *         lookups at a time.
- *
- *  @param[in] bus     - The bus object used for lookups
- *  @param[in] params  - The parameters for the channel
- *  @param[in] idx     - The index of the desired address on the interface
- *  @param[in] origins - The allowed origins for the address objects
- *  @return The address and prefix if it was found
- */
-template <int family>
-auto getIfAddr(sdbusplus::bus::bus& bus, const ChannelParams& params,
-               uint8_t idx,
-               const std::unordered_set<IP::AddressOrigin>& origins)
-{
-    ObjectLookupCache ips(bus, params, INTF_IP);
-    return findIfAddr<family>(bus, params, idx, origins, ips);
-}
-
-/** @brief Deletes the dbus object. Ignores empty objects or objects that are
- *         missing from the bus.
- *
- *  @param[in] bus     - The bus object used for lookups
- *  @param[in] service - The name of the service
- *  @param[in] path    - The path of the object to delete
- */
-void deleteObjectIfExists(sdbusplus::bus::bus& bus, const std::string& service,
+void deleteObjectIfExists(sdbusplus::bus_t& bus, const std::string& service,
                           const std::string& path)
 {
     if (path.empty())
@@ -766,11 +239,16 @@ void deleteObjectIfExists(sdbusplus::bus::bus& bus, const std::string& service,
                                        ipmi::DELETE_INTERFACE, "Delete");
         bus.call_noreply(req);
     }
-    catch (const sdbusplus::exception::SdBusError& e)
+    catch (const UnknownObject&)
     {
-        if (strcmp(e.name(),
-                   "xyz.openbmc_project.Common.Error.InternalFailure") != 0 &&
-            strcmp(e.name(), "org.freedesktop.DBus.Error.UnknownObject") != 0)
+        // Object already gone; nothing to do.
+    }
+    catch (const sdbusplus::exception_t& e)
+    {
+        // InternalFailure and NotAllowed are legacy errors, so match them
+        // by name.
+        if (std::string_view{InternalFailure::errName} != e.name() &&
+            std::string_view{NotAllowed::errName} != e.name())
         {
             // We want to rethrow real errors
             throw;
@@ -788,17 +266,17 @@ void deleteObjectIfExists(sdbusplus::bus::bus& bus, const std::string& service,
  *  @param[in] prefix  - The prefix of the new IP
  */
 template <int family>
-void createIfAddr(sdbusplus::bus::bus& bus, const ChannelParams& params,
-                  const typename AddrFamily<family>::addr& address,
-                  uint8_t prefix)
+void createIfAddr(sdbusplus::bus_t& bus, const ChannelParams& params,
+                  typename AddrFamily<family>::addr address, uint8_t prefix)
 {
     auto newreq =
         bus.new_method_call(params.service.c_str(), params.logicalPath.c_str(),
                             INTF_IP_CREATE, "IP");
     std::string protocol =
-        sdbusplus::xyz::openbmc_project::Network::server::convertForMessage(
+        sdbusplus::common::xyz::openbmc_project::network::convertForMessage(
             AddrFamily<family>::protocol);
-    newreq.append(protocol, addrToString<family>(address), prefix, "");
+    stdplus::ToStrHandle<stdplus::ToStr<typename AddrFamily<family>::addr>> tsh;
+    newreq.append(protocol, tsh(address), prefix, "");
     bus.call_noreply(newreq);
 }
 
@@ -808,9 +286,38 @@ void createIfAddr(sdbusplus::bus::bus& bus, const ChannelParams& params,
  *  @param[in] params - The parameters for the channel
  *  @return The address and prefix if found
  */
-auto getIfAddr4(sdbusplus::bus::bus& bus, const ChannelParams& params)
+auto getIfAddr4(sdbusplus::bus_t& bus, const ChannelParams& params)
 {
-    return getIfAddr<AF_INET>(bus, params, 0, originsV4);
+    std::optional<IfAddr<AF_INET>> ifaddr4 = std::nullopt;
+    IP::AddressOrigin src;
+
+    try
+    {
+        src = std::get<bool>(
+                  getDbusProperty(bus, params.service, params.logicalPath,
+                                  INTF_ETHERNET, "DHCP4"))
+                  ? IP::AddressOrigin::DHCP
+                  : IP::AddressOrigin::Static;
+    }
+    catch (const sdbusplus::exception_t& e)
+    {
+        lg2::error("Failed to get IPv4 source");
+        return ifaddr4;
+    }
+
+    for (uint8_t i = 0; i < MAX_IPV4_ADDRESSES; ++i)
+    {
+        ifaddr4 = getIfAddr<AF_INET>(bus, params, i, originsV4);
+        if (ifaddr4 && src == ifaddr4->origin)
+        {
+            break;
+        }
+        else
+        {
+            ifaddr4 = std::nullopt;
+        }
+    }
+    return ifaddr4;
 }
 
 /** @brief Reconfigures the IPv4 address info configured for the interface
@@ -820,109 +327,34 @@ auto getIfAddr4(sdbusplus::bus::bus& bus, const ChannelParams& params)
  *  @param[in] address - The new address if specified
  *  @param[in] prefix  - The new address prefix if specified
  */
-void reconfigureIfAddr4(sdbusplus::bus::bus& bus, const ChannelParams& params,
-                        const std::optional<in_addr>& address,
+void reconfigureIfAddr4(sdbusplus::bus_t& bus, const ChannelParams& params,
+                        std::optional<stdplus::In4Addr> address,
                         std::optional<uint8_t> prefix)
 {
     auto ifaddr = getIfAddr4(bus, params);
     if (!ifaddr && !address)
     {
-        log<level::ERR>("Missing address for IPv4 assignment");
+        lg2::error("Missing address for IPv4 assignment");
         elog<InternalFailure>();
     }
     uint8_t fallbackPrefix = AddrFamily<AF_INET>::defaultPrefix;
+    auto addr = stdplus::In4Addr{};
     if (ifaddr)
     {
+        addr = ifaddr->address;
         fallbackPrefix = ifaddr->prefix;
         deleteObjectIfExists(bus, params.service, ifaddr->path);
     }
-    createIfAddr<AF_INET>(bus, params, address.value_or(ifaddr->address),
-                          prefix.value_or(fallbackPrefix));
-}
-
-template <int family>
-std::optional<IfNeigh<family>>
-    findStaticNeighbor(sdbusplus::bus::bus& bus, const ChannelParams& params,
-                       const typename AddrFamily<family>::addr& ip,
-                       ObjectLookupCache& neighbors)
-{
-    const auto state =
-        sdbusplus::xyz::openbmc_project::Network::server::convertForMessage(
-            Neighbor::State::Permanent);
-    for (const auto& [path, neighbor] : neighbors)
+    addr = address.value_or(addr);
+    if (addr != stdplus::In4Addr{})
     {
-        const auto& ipStr = std::get<std::string>(neighbor.at("IPAddress"));
-        auto neighIP = maybeStringToAddr<family>(ipStr.c_str());
-        if (!neighIP)
-        {
-            continue;
-        }
-        if (!equal(*neighIP, ip))
-        {
-            continue;
-        }
-        if (state != std::get<std::string>(neighbor.at("State")))
-        {
-            continue;
-        }
-
-        IfNeigh<family> ret;
-        ret.path = path;
-        ret.ip = ip;
-        const auto& macStr = std::get<std::string>(neighbor.at("MACAddress"));
-        ret.mac = stringToMAC(macStr.c_str());
-        return std::move(ret);
-    }
-
-    return std::nullopt;
-}
-
-template <int family>
-void createNeighbor(sdbusplus::bus::bus& bus, const ChannelParams& params,
-                    const typename AddrFamily<family>::addr& address,
-                    const ether_addr& mac)
-{
-    auto newreq =
-        bus.new_method_call(params.service.c_str(), params.logicalPath.c_str(),
-                            INTF_NEIGHBOR_CREATE_STATIC, "Neighbor");
-    std::string macStr = ether_ntoa(&mac);
-    newreq.append(addrToString<family>(address), macStr);
-    bus.call_noreply(newreq);
-}
-
-/** @brief Sets the system wide value for the default gateway
- *
- *  @param[in] bus     - The bus object used for lookups
- *  @param[in] params  - The parameters for the channel
- *  @param[in] gateway - Gateway address to apply
- */
-template <int family>
-void setGatewayProperty(sdbusplus::bus::bus& bus, const ChannelParams& params,
-                        const typename AddrFamily<family>::addr& address)
-{
-    // Save the old gateway MAC address if it exists so we can recreate it
-    auto gateway = getGatewayProperty<family>(bus, params);
-    std::optional<IfNeigh<family>> neighbor;
-    if (gateway)
-    {
-        ObjectLookupCache neighbors(bus, params, INTF_NEIGHBOR);
-        neighbor = findStaticNeighbor<family>(bus, params, *gateway, neighbors);
-    }
-
-    setDbusProperty(bus, params.service, PATH_SYSTEMCONFIG, INTF_SYSTEMCONFIG,
-                    AddrFamily<family>::propertyGateway,
-                    addrToString<family>(address));
-
-    // Restore the gateway MAC if we had one
-    if (neighbor)
-    {
-        deleteObjectIfExists(bus, params.service, neighbor->path);
-        createNeighbor<family>(bus, params, address, neighbor->mac);
+        createIfAddr<AF_INET>(bus, params, addr,
+                              prefix.value_or(fallbackPrefix));
     }
 }
 
 template <int family>
-std::optional<IfNeigh<family>> findGatewayNeighbor(sdbusplus::bus::bus& bus,
+std::optional<IfNeigh<family>> findGatewayNeighbor(sdbusplus::bus_t& bus,
                                                    const ChannelParams& params,
                                                    ObjectLookupCache& neighbors)
 {
@@ -936,7 +368,7 @@ std::optional<IfNeigh<family>> findGatewayNeighbor(sdbusplus::bus::bus& bus,
 }
 
 template <int family>
-std::optional<IfNeigh<family>> getGatewayNeighbor(sdbusplus::bus::bus& bus,
+std::optional<IfNeigh<family>> getGatewayNeighbor(sdbusplus::bus_t& bus,
                                                   const ChannelParams& params)
 {
     ObjectLookupCache neighbors(bus, params, INTF_NEIGHBOR);
@@ -944,13 +376,13 @@ std::optional<IfNeigh<family>> getGatewayNeighbor(sdbusplus::bus::bus& bus,
 }
 
 template <int family>
-void reconfigureGatewayMAC(sdbusplus::bus::bus& bus,
-                           const ChannelParams& params, const ether_addr& mac)
+void reconfigureGatewayMAC(sdbusplus::bus_t& bus, const ChannelParams& params,
+                           stdplus::EtherAddr mac)
 {
     auto gateway = getGatewayProperty<family>(bus, params);
     if (!gateway)
     {
-        log<level::ERR>("Tried to set Gateway MAC without Gateway");
+        lg2::error("Tried to set Gateway MAC without Gateway");
         elog<InternalFailure>();
     }
 
@@ -971,7 +403,7 @@ void reconfigureGatewayMAC(sdbusplus::bus::bus& bus,
  *  @param[in] params  - The parameters for the channel
  *  @param[in] idx     - The address index to operate on
  */
-void deconfigureIfAddr6(sdbusplus::bus::bus& bus, const ChannelParams& params,
+void deconfigureIfAddr6(sdbusplus::bus_t& bus, const ChannelParams& params,
                         uint8_t idx)
 {
     auto ifaddr = getIfAddr<AF_INET6>(bus, params, idx, originsV6Static);
@@ -989,8 +421,8 @@ void deconfigureIfAddr6(sdbusplus::bus::bus& bus, const ChannelParams& params,
  *  @param[in] address - The new address
  *  @param[in] prefix  - The new address prefix
  */
-void reconfigureIfAddr6(sdbusplus::bus::bus& bus, const ChannelParams& params,
-                        uint8_t idx, const in6_addr& address, uint8_t prefix)
+void reconfigureIfAddr6(sdbusplus::bus_t& bus, const ChannelParams& params,
+                        uint8_t idx, stdplus::In6Addr address, uint8_t prefix)
 {
     deconfigureIfAddr6(bus, params, idx);
     createIfAddr<AF_INET6>(bus, params, address, prefix);
@@ -1013,11 +445,11 @@ IPv6Source originToSourceType(IP::AddressOrigin origin)
             return IPv6Source::SLAAC;
         default:
         {
-            auto originStr = sdbusplus::xyz::openbmc_project::Network::server::
+            auto originStr = sdbusplus::common::xyz::openbmc_project::network::
                 convertForMessage(origin);
-            log<level::ERR>(
-                "Invalid IP::AddressOrigin conversion to IPv6Source",
-                entry("ORIGIN=%s", originStr.c_str()));
+            lg2::error("Invalid IP::AddressOrigin conversion to IPv6Source, "
+                       "origin: {ORIGIN}",
+                       "ORIGIN", originStr);
             elog<InternalFailure>();
         }
     }
@@ -1035,25 +467,25 @@ void getLanIPv6Address(message::Payload& ret, uint8_t channel, uint8_t set,
 {
     auto source = IPv6Source::Static;
     bool enabled = false;
-    in6_addr addr{};
-    uint8_t prefix = AddrFamily<AF_INET6>::defaultPrefix;
+    stdplus::In6Addr addr{};
+    uint8_t prefix{};
     auto status = IPv6AddressStatus::Disabled;
 
     auto ifaddr = channelCall<getIfAddr<AF_INET6>>(channel, set, origins);
     if (ifaddr)
     {
         source = originToSourceType(ifaddr->origin);
-        enabled = true;
+        enabled = (origins == originsV6Static);
         addr = ifaddr->address;
         prefix = ifaddr->prefix;
         status = IPv6AddressStatus::Active;
     }
 
     ret.pack(set);
-    ret.pack(static_cast<uint4_t>(source), uint3_t{}, enabled);
-    ret.pack(std::string_view(reinterpret_cast<char*>(&addr), sizeof(addr)));
+    ret.pack(types::enum_cast<uint4_t>(source), uint3_t{}, enabled);
+    ret.pack(stdplus::raw::asView<char>(addr));
     ret.pack(prefix);
-    ret.pack(static_cast<uint8_t>(status));
+    ret.pack(types::enum_cast<uint8_t>(status));
 }
 
 /** @brief Gets the vlan ID configured on the interface
@@ -1062,7 +494,7 @@ void getLanIPv6Address(message::Payload& ret, uint8_t channel, uint8_t set,
  *  @param[in] params - The parameters for the channel
  *  @return VLAN id or the standard 0 for no VLAN
  */
-uint16_t getVLANProperty(sdbusplus::bus::bus& bus, const ChannelParams& params)
+uint16_t getVLANProperty(sdbusplus::bus_t& bus, const ChannelParams& params)
 {
     // VLAN devices will always have a separate logical object
     if (params.ifPath == params.logicalPath)
@@ -1074,8 +506,9 @@ uint16_t getVLANProperty(sdbusplus::bus::bus& bus, const ChannelParams& params)
         bus, params.service, params.logicalPath, INTF_VLAN, "Id"));
     if ((vlan & VLAN_VALUE_MASK) != vlan)
     {
-        logWithChannel<level::ERR>(params, "networkd returned an invalid vlan",
-                                   entry("VLAN=%" PRIu32, vlan));
+        lg2::error("networkd returned an invalid vlan: {VLAN} "
+                   "(CH={CHANNEL}, IF={IFNAME})",
+                   "CHANNEL", params.id, "IFNAME", params.ifname, "VLAN", vlan);
         elog<InternalFailure>();
     }
     return vlan;
@@ -1086,18 +519,15 @@ uint16_t getVLANProperty(sdbusplus::bus::bus& bus, const ChannelParams& params)
  *  @param[in] bus    - The bus object used for lookups
  *  @param[in] params - The parameters for the channel
  */
-void deconfigureChannel(sdbusplus::bus::bus& bus, ChannelParams& params)
+void deconfigureChannel(sdbusplus::bus_t& bus, ChannelParams& params)
 {
     // Delete all objects associated with the interface
-    auto objreq = bus.new_method_call(MAPPER_BUS_NAME, MAPPER_OBJ, MAPPER_INTF,
-                                      "GetSubTree");
-    objreq.append(PATH_ROOT, 0, std::vector<std::string>{DELETE_INTERFACE});
-    auto objreply = bus.call(objreq);
-    ObjectTree objs;
-    objreply.read(objs);
+    ObjectTree objs =
+        ipmi::getSubTree(bus, std::vector<std::string>{DELETE_INTERFACE},
+                         std::string{PATH_ROOT});
     for (const auto& [path, impls] : objs)
     {
-        if (path.find(params.ifname) == path.npos)
+        if (!ifnameInPath(params.ifname, path))
         {
             continue;
         }
@@ -1113,7 +543,37 @@ void deconfigureChannel(sdbusplus::bus::bus& bus, ChannelParams& params)
     }
 
     // Clear out any settings on the lower physical interface
-    setDHCPv6Property(bus, params, EthernetInterface::DHCPConf::none, false);
+    setEthProp(bus, params, "DHCP4", false);
+    setEthProp(bus, params, "DHCP6", false);
+    setEthProp(bus, params, "IPv6AcceptRA", false);
+}
+
+/** @brief Deletes all of the possible configuration parameters for VLAN
+ * interface
+ *
+ *  @param[in] bus    - The bus object used for lookups
+ *  @param[in] params - The parameters for the vlan interface
+ */
+void deconfigureVLAN(sdbusplus::bus_t& bus, ChannelParams& params)
+{
+    std::vector<std::string> interfaces = {INTF_VLAN};
+    ObjectTree objs = ipmi::getSubTree(bus, interfaces, std::string{PATH_ROOT});
+
+    for (const auto& [path, impls] : objs)
+    {
+        if (!ifnameInPath(params.ifname, path))
+        {
+            continue;
+        }
+        for (const auto& [service, intfs] : impls)
+        {
+            deleteObjectIfExists(bus, service, path);
+        }
+        if (path == params.logicalPath)
+        {
+            params.logicalPath = params.ifPath;
+        }
+    }
 }
 
 /** @brief Creates a new VLAN on the specified interface
@@ -1122,19 +582,19 @@ void deconfigureChannel(sdbusplus::bus::bus& bus, ChannelParams& params)
  *  @param[in] params - The parameters for the channel
  *  @param[in] vlan   - The id of the new vlan
  */
-void createVLAN(sdbusplus::bus::bus& bus, ChannelParams& params, uint16_t vlan)
+void createVLAN(sdbusplus::bus_t& bus, ChannelParams& params, uint16_t vlan)
 {
     if (vlan == 0)
     {
         return;
     }
 
-    auto req = bus.new_method_call(params.service.c_str(), PATH_ROOT,
+    auto req = bus.new_method_call(params.service.c_str(), PATH_ROOT.c_str(),
                                    INTF_VLAN_CREATE, "VLAN");
     req.append(params.ifname, static_cast<uint32_t>(vlan));
     auto reply = bus.call(req);
-    sdbusplus::message::object_path newPath;
-    reply.read(newPath);
+    auto newPath = reply.unpack<sdbusplus::object_path>();
+
     params.logicalPath = std::move(newPath);
 }
 
@@ -1144,16 +604,29 @@ void createVLAN(sdbusplus::bus::bus& bus, ChannelParams& params, uint16_t vlan)
  *  @param[in] params - The parameters for the channel
  *  @param[in] vlan   - The new vlan id to use
  */
-void reconfigureVLAN(sdbusplus::bus::bus& bus, ChannelParams& params,
+void reconfigureVLAN(sdbusplus::bus_t& bus, ChannelParams& params,
                      uint16_t vlan)
 {
-    // Unfortunatetly we don't have built-in functions to migrate our interface
+    // If the VLAN id is unchanged, no reconfiguration is needed
+    uint16_t currentVlan = getVLANProperty(bus, params);
+    if (currentVlan == vlan)
+    {
+        lg2::info("VLAN id {VLAN} is already configured on {IFNAME}, "
+                  "skipping reconfiguration",
+                  "VLAN", vlan, "IFNAME", params.ifname);
+        return;
+    }
+
+    // Unfortunately we don't have built-in functions to migrate our interface
     // customizations to new VLAN interfaces, or have some kind of decoupling.
     // We therefore must retain all of our old information, setup the new VLAN
     // configuration, then restore the old info.
 
     // Save info from the old logical interface
-    ObjectLookupCache ips(bus, params, INTF_IP);
+    bool dhcp4 = getEthProp<bool>(bus, params, "DHCP4");
+    bool dhcp6 = getEthProp<bool>(bus, params, "DHCP6");
+    bool ra = getEthProp<bool>(bus, params, "IPv6AcceptRA");
+    ObjectLookupCache ips(bus, params, NetworkIP::interface);
     auto ifaddr4 = findIfAddr<AF_INET>(bus, params, 0, originsV4, ips);
     std::vector<IfAddr<AF_INET6>> ifaddrs6;
     for (uint8_t i = 0; i < MAX_IPV6_STATIC_ADDRESSES; ++i)
@@ -1166,16 +639,19 @@ void reconfigureVLAN(sdbusplus::bus::bus& bus, ChannelParams& params,
         }
         ifaddrs6.push_back(std::move(*ifaddr6));
     }
-    EthernetInterface::DHCPConf dhcp = getDHCPProperty(bus, params);
     ObjectLookupCache neighbors(bus, params, INTF_NEIGHBOR);
     auto neighbor4 = findGatewayNeighbor<AF_INET>(bus, params, neighbors);
     auto neighbor6 = findGatewayNeighbor<AF_INET6>(bus, params, neighbors);
 
-    deconfigureChannel(bus, params);
+    if (params.logicalPath != params.ifPath)
+    {
+        deconfigureVLAN(bus, params);
+    }
     createVLAN(bus, params, vlan);
 
-    // Re-establish the saved settings
-    setDHCPv6Property(bus, params, dhcp, false);
+    setEthProp(bus, params, "DHCP4", dhcp4);
+    setEthProp(bus, params, "DHCP6", dhcp6);
+    setEthProp(bus, params, "IPv6AcceptRA", ra);
     if (ifaddr4)
     {
         createIfAddr<AF_INET>(bus, params, ifaddr4->address, ifaddr4->prefix);
@@ -1194,46 +670,6 @@ void reconfigureVLAN(sdbusplus::bus::bus& bus, ChannelParams& params,
     }
 }
 
-/** @brief Turns a prefix into a netmask
- *
- *  @param[in] prefix - The prefix length
- *  @return The netmask
- */
-in_addr prefixToNetmask(uint8_t prefix)
-{
-    if (prefix > 32)
-    {
-        log<level::ERR>("Invalid prefix", entry("PREFIX=%" PRIu8, prefix));
-        elog<InternalFailure>();
-    }
-    if (prefix == 0)
-    {
-        // Avoids 32-bit lshift by 32 UB
-        return {};
-    }
-    return {htobe32(~UINT32_C(0) << (32 - prefix))};
-}
-
-/** @brief Turns a a netmask into a prefix length
- *
- *  @param[in] netmask - The netmask in byte form
- *  @return The prefix length
- */
-uint8_t netmaskToPrefix(in_addr netmask)
-{
-    uint32_t x = be32toh(netmask.s_addr);
-    if ((~x & (~x + 1)) != 0)
-    {
-        char maskStr[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &netmask, maskStr, sizeof(maskStr));
-        log<level::ERR>("Invalid netmask", entry("NETMASK=%s", maskStr));
-        elog<InternalFailure>();
-    }
-    return static_cast<bool>(x)
-               ? AddrFamily<AF_INET>::defaultPrefix - __builtin_ctz(x)
-               : 0;
-}
-
 // We need to store this value so it can be returned to the client
 // It is volatile so safe to store in daemon memory.
 static std::unordered_map<uint8_t, SetStatus> setStatus;
@@ -1245,7 +681,7 @@ static std::unordered_map<uint8_t, SetStatus> setStatus;
 static std::unordered_map<uint8_t, uint16_t> lastDisabledVlan;
 
 /** @brief Gets the set status for the channel if it exists
- *         Otherise populates and returns the default value.
+ *         Otherwise populates and returns the default value.
  *
  *  @param[in] channel - The channel id corresponding to an ethernet interface
  *  @return A reference to the SetStatus for the channel
@@ -1260,6 +696,27 @@ SetStatus& getSetStatus(uint8_t channel)
     return setStatus[channel] = SetStatus::Complete;
 }
 
+/** @brief Unpacks the trivially copyable type from the message */
+template <typename T>
+static T unpackT(message::Payload& req)
+{
+    std::array<uint8_t, sizeof(T)> bytes;
+    if (req.unpack(bytes) != 0)
+    {
+        throw ccReqDataLenInvalid;
+    }
+    return stdplus::raw::copyFrom<T>(bytes);
+}
+
+/** @brief Ensure the message is fully unpacked */
+static void unpackFinal(message::Payload& req)
+{
+    if (!req.fullyUnpacked())
+    {
+        throw ccReqDataTruncated;
+    }
+}
+
 /**
  * Define placeholder command handlers for the OEM Extension bytes for the Set
  * LAN Configuration Parameters and Get LAN Configuration Parameters
@@ -1272,19 +729,19 @@ SetStatus& getSetStatus(uint8_t channel)
  *     function names below (i.e. setLanOem). The default name for the
  *     transport IPMI commands is transporthandler_oem.cpp.
  *   Add:
- *      EXTRA_OECONF_append = " --enable-transport-oem=yes"
- *   Create a do_compile_prepend()/do_install_append method in your
+ *      EXTRA_OEMESON:append = "-Dtransport-oem=enabled"
+ *   Create a do_configure:prepend()/do_install:append() method in your
  *   bbappend file to copy the file to the build directory.
  *   Add:
  *   PROJECT_SRC_DIR := "${THISDIR}/${PN}"
  *   # Copy the "strong" functions into the working directory, overriding the
  *   # placeholder functions.
- *   do_compile_prepend(){
+ *   do_configure:prepend(){
  *      cp -f ${PROJECT_SRC_DIR}/transporthandler_oem.cpp ${S}
  *   }
  *
- *   # Clean up after complilation has completed
- *   do_install_append(){
+ *   # Clean up after compilation has completed
+ *   do_install:append(){
  *      rm -f ${S}/transporthandler_oem.cpp
  *   }
  *
@@ -1302,51 +759,54 @@ RspType<message::Payload> getLanOem(uint8_t channel, uint8_t parameter,
                                     uint8_t set, uint8_t block)
     __attribute__((weak));
 
-RspType<> setLanOem(uint8_t channel, uint8_t parameter, message::Payload& req)
+RspType<> setLanOem(uint8_t, uint8_t, message::Payload& req)
 {
     req.trailingOk = true;
-    return response(ccParamNotSupported);
+    return responseParamNotSupported();
 }
 
-RspType<message::Payload> getLanOem(uint8_t channel, uint8_t parameter,
-                                    uint8_t set, uint8_t block)
+RspType<message::Payload> getLanOem(uint8_t, uint8_t, uint8_t, uint8_t)
 {
-    return response(ccParamNotSupported);
+    return responseParamNotSupported();
 }
+
 /**
- * @brief is MAC address valid.
+ * @brief is a valid LAN channel.
  *
- * This function checks whether the MAC address is valid or not.
+ * This function checks whether the input channel is a valid LAN channel or not.
  *
- * @param[in] mac - MAC address.
- * @return true if MAC address is valid else retun false.
+ * @param[in] channel: the channel number.
+ * @return nullopt if the channel is invalid, false if the channel is not a LAN
+ * channel, true if the channel is a LAN channel.
  **/
-bool isValidMACAddress(const ether_addr& mac)
+std::optional<bool> isLanChannel(uint8_t channel)
 {
-    // check if mac address is empty
-    if (equal(mac, ether_addr{}))
+    ChannelInfo chInfo;
+    auto cc = getChannelInfo(channel, chInfo);
+    if (cc != ccSuccess)
     {
-        return false;
+        return std::nullopt;
     }
-    // we accept only unicast MAC addresses and  same thing has been checked in
-    // phosphor-network layer. If the least significant bit of the first octet
-    // is set to 1, it is multicast MAC else it is unicast MAC address.
-    if (mac.ether_addr_octet[0] & 1)
-    {
-        return false;
-    }
-    return true;
+
+    return chInfo.mediumType ==
+           static_cast<uint8_t>(EChannelMediumType::lan8032);
 }
 
-RspType<> setLan(Context::ptr ctx, uint4_t channelBits, uint4_t reserved1,
-                 uint8_t parameter, message::Payload& req)
+RspType<> setLanInt(Context::ptr ctx, uint4_t channelBits, uint4_t reserved1,
+                    uint8_t parameter, message::Payload& req)
 {
     const uint8_t channel = convertCurrentChannelNum(
         static_cast<uint8_t>(channelBits), ctx->channel);
     if (reserved1 || !isValidChannel(channel))
     {
-        log<level::ERR>("Set Lan - Invalid field in request");
+        lg2::error("Set Lan - Invalid field in request");
         req.trailingOk = true;
+        return responseInvalidFieldRequest();
+    }
+
+    if (!isLanChannel(channel).value_or(false))
+    {
+        lg2::error("Set Lan - Not a LAN channel");
         return responseInvalidFieldRequest();
     }
 
@@ -1377,7 +837,7 @@ RspType<> setLan(Context::ptr ctx, uint4_t channelBits, uint4_t reserved1,
                     auto& storedStatus = getSetStatus(channel);
                     if (storedStatus == SetStatus::InProgress)
                     {
-                        return response(ccParamSetLocked);
+                        return responseParamSetLocked();
                     }
                     storedStatus = status;
                     return responseSuccess();
@@ -1388,35 +848,28 @@ RspType<> setLan(Context::ptr ctx, uint4_t channelBits, uint4_t reserved1,
                         return responseInvalidFieldRequest();
                     }
                     return responseSuccess();
+                default:
+                    return responseInvalidFieldRequest();
             }
-            return response(ccParamNotSupported);
         }
         case LanParam::AuthSupport:
         {
             req.trailingOk = true;
-            return response(ccParamReadOnly);
+            return responseParamReadOnly();
         }
         case LanParam::AuthEnables:
         {
             req.trailingOk = true;
-            return response(ccParamReadOnly);
+            return responseParamReadOnly();
         }
         case LanParam::IP:
         {
-            EthernetInterface::DHCPConf dhcp =
-                channelCall<getDHCPProperty>(channel);
-            if ((dhcp == EthernetInterface::DHCPConf::v4) ||
-                (dhcp == EthernetInterface::DHCPConf::both))
+            if (channelCall<getEthProp<bool>>(channel, "DHCP4"))
             {
                 return responseCommandNotAvailable();
             }
-            in_addr ip;
-            std::array<uint8_t, sizeof(ip)> bytes;
-            if (req.unpack(bytes) != 0 || !req.fullyUnpacked())
-            {
-                return responseReqDataLenInvalid();
-            }
-            copyInto(ip, bytes);
+            auto ip = unpackT<stdplus::In4Addr>(req);
+            unpackFinal(req);
             channelCall<reconfigureIfAddr4>(channel, ip, std::nullopt);
             return responseSuccess();
         }
@@ -1424,10 +877,11 @@ RspType<> setLan(Context::ptr ctx, uint4_t channelBits, uint4_t reserved1,
         {
             uint4_t flag;
             uint4_t rsvd;
-            if (req.unpack(flag, rsvd) != 0 || !req.fullyUnpacked())
+            if (req.unpack(flag, rsvd) != 0)
             {
                 return responseReqDataLenInvalid();
             }
+            unpackFinal(req);
             if (rsvd)
             {
                 return responseInvalidFieldRequest();
@@ -1435,111 +889,79 @@ RspType<> setLan(Context::ptr ctx, uint4_t channelBits, uint4_t reserved1,
             switch (static_cast<IPSrc>(static_cast<uint8_t>(flag)))
             {
                 case IPSrc::DHCP:
-                {
                     // The IPSrc IPMI command is only for IPv4
                     // management. Modifying IPv6 state is done using
                     // a completely different Set LAN Configuration
                     // subcommand.
-                    channelCall<setDHCPv4Property>(
-                        channel, EthernetInterface::DHCPConf::v4);
+                    channelCall<setEthProp<bool>>(channel, "DHCP4", true);
                     return responseSuccess();
-                }
                 case IPSrc::Unspecified:
                 case IPSrc::Static:
-                {
-                    channelCall<setDHCPv4Property>(
-                        channel, EthernetInterface::DHCPConf::none);
+                    channelCall<setEthProp<bool>>(channel, "DHCP4", false);
                     return responseSuccess();
-                }
                 case IPSrc::BIOS:
                 case IPSrc::BMC:
-                {
                     return responseInvalidFieldRequest();
-                }
             }
-            return response(ccParamNotSupported);
+            return responseParamNotSupported();
         }
         case LanParam::MAC:
         {
-            ether_addr mac;
-            std::array<uint8_t, sizeof(mac)> bytes;
-            if (req.unpack(bytes) != 0 || !req.fullyUnpacked())
-            {
-                return responseReqDataLenInvalid();
-            }
-            copyInto(mac, bytes);
-
-            if (!isValidMACAddress(mac))
-            {
-                return responseInvalidFieldRequest();
-            }
+            auto mac = unpackT<stdplus::EtherAddr>(req);
+            unpackFinal(req);
             channelCall<setMACProperty>(channel, mac);
             return responseSuccess();
         }
         case LanParam::SubnetMask:
         {
-            EthernetInterface::DHCPConf dhcp =
-                channelCall<getDHCPProperty>(channel);
-            if ((dhcp == EthernetInterface::DHCPConf::v4) ||
-                (dhcp == EthernetInterface::DHCPConf::both))
+            if (channelCall<getEthProp<bool>>(channel, "DHCP4"))
             {
                 return responseCommandNotAvailable();
             }
-            in_addr netmask;
-            std::array<uint8_t, sizeof(netmask)> bytes;
-            if (req.unpack(bytes) != 0 || !req.fullyUnpacked())
+            uint8_t pfx;
+            try
             {
-                return responseReqDataLenInvalid();
+                pfx = stdplus::maskToPfx(unpackT<stdplus::In4Addr>(req));
             }
-            copyInto(netmask, bytes);
-            channelCall<reconfigureIfAddr4>(channel, std::nullopt,
-                                            netmaskToPrefix(netmask));
+            catch (const std::invalid_argument&)
+            {
+                return responseInvalidFieldRequest();
+            }
+            unpackFinal(req);
+            channelCall<reconfigureIfAddr4>(channel, std::nullopt, pfx);
             return responseSuccess();
         }
         case LanParam::Gateway1:
         {
-            EthernetInterface::DHCPConf dhcp =
-                channelCall<getDHCPProperty>(channel);
-            if ((dhcp == EthernetInterface::DHCPConf::v4) ||
-                (dhcp == EthernetInterface::DHCPConf::both))
+            if (channelCall<getEthProp<bool>>(channel, "DHCP4"))
             {
                 return responseCommandNotAvailable();
             }
-            in_addr gateway;
-            std::array<uint8_t, sizeof(gateway)> bytes;
-            if (req.unpack(bytes) != 0 || !req.fullyUnpacked())
-            {
-                return responseReqDataLenInvalid();
-            }
-            copyInto(gateway, bytes);
+            auto gateway = unpackT<stdplus::In4Addr>(req);
+            unpackFinal(req);
             channelCall<setGatewayProperty<AF_INET>>(channel, gateway);
             return responseSuccess();
         }
         case LanParam::Gateway1MAC:
         {
-            ether_addr gatewayMAC;
-            std::array<uint8_t, sizeof(gatewayMAC)> bytes;
-            if (req.unpack(bytes) != 0 || !req.fullyUnpacked())
-            {
-                return responseReqDataLenInvalid();
-            }
-            copyInto(gatewayMAC, bytes);
+            auto gatewayMAC = unpackT<stdplus::EtherAddr>(req);
+            unpackFinal(req);
             channelCall<reconfigureGatewayMAC<AF_INET>>(channel, gatewayMAC);
             return responseSuccess();
         }
         case LanParam::VLANId:
         {
-            uint12_t vlanData = 0;
-            uint3_t reserved = 0;
-            bool vlanEnable = 0;
+            uint12_t vlanData;
+            uint3_t rsvd;
+            bool vlanEnable;
 
-            if (req.unpack(vlanData) || req.unpack(reserved) ||
-                req.unpack(vlanEnable) || !req.fullyUnpacked())
+            if (req.unpack(vlanData, rsvd, vlanEnable) != 0)
             {
                 return responseReqDataLenInvalid();
             }
+            unpackFinal(req);
 
-            if (reserved)
+            if (rsvd)
             {
                 return responseInvalidFieldRequest();
             }
@@ -1564,51 +986,63 @@ RspType<> setLan(Context::ptr ctx, uint4_t channelBits, uint4_t reserved1,
         case LanParam::IPFamilySupport:
         {
             req.trailingOk = true;
-            return response(ccParamReadOnly);
+            return responseParamReadOnly();
         }
         case LanParam::IPFamilyEnables:
         {
             uint8_t enables;
-            if (req.unpack(enables) != 0 || !req.fullyUnpacked())
+            if (req.unpack(enables) != 0)
             {
                 return responseReqDataLenInvalid();
             }
+            unpackFinal(req);
             switch (static_cast<IPFamilyEnables>(enables))
             {
                 case IPFamilyEnables::DualStack:
                     return responseSuccess();
                 case IPFamilyEnables::IPv4Only:
                 case IPFamilyEnables::IPv6Only:
-                    return response(ccParamNotSupported);
+                    return responseParamNotSupported();
             }
-            return response(ccParamNotSupported);
+            return responseParamNotSupported();
         }
         case LanParam::IPv6Status:
         {
             req.trailingOk = true;
-            return response(ccParamReadOnly);
+            return responseParamReadOnly();
         }
         case LanParam::IPv6StaticAddresses:
         {
             uint8_t set;
             uint7_t rsvd;
             bool enabled;
-            in6_addr ip;
-            std::array<uint8_t, sizeof(ip)> ipbytes;
             uint8_t prefix;
             uint8_t status;
-            if (req.unpack(set, rsvd, enabled, ipbytes, prefix, status) != 0 ||
-                !req.fullyUnpacked())
+            if (req.unpack(set, rsvd, enabled) != 0)
             {
                 return responseReqDataLenInvalid();
             }
+            auto ip = unpackT<stdplus::In6Addr>(req);
+            if (req.unpack(prefix, status) != 0)
+            {
+                return responseReqDataLenInvalid();
+            }
+            unpackFinal(req);
             if (rsvd)
             {
                 return responseInvalidFieldRequest();
             }
-            copyInto(ip, ipbytes);
+            if (set >= MAX_IPV6_STATIC_ADDRESSES)
+            {
+                return responseParmOutOfRange();
+            }
             if (enabled)
             {
+                if (prefix < MIN_IPV6_PREFIX_LENGTH ||
+                    prefix > MAX_IPV6_PREFIX_LENGTH)
+                {
+                    return responseParmOutOfRange();
+                }
                 channelCall<reconfigureIfAddr6>(channel, set, ip, prefix);
             }
             else
@@ -1620,64 +1054,51 @@ RspType<> setLan(Context::ptr ctx, uint4_t channelBits, uint4_t reserved1,
         case LanParam::IPv6DynamicAddresses:
         {
             req.trailingOk = true;
-            return response(ccParamReadOnly);
+            return responseParamReadOnly();
         }
         case LanParam::IPv6RouterControl:
         {
             std::bitset<8> control;
-            if (req.unpack(control) != 0 || !req.fullyUnpacked())
+            constexpr uint8_t reservedRACCBits = 0xfc;
+            if (req.unpack(control) != 0)
             {
                 return responseReqDataLenInvalid();
             }
-            std::bitset<8> expected;
-            EthernetInterface::DHCPConf dhcp =
-                channelCall<getDHCPProperty>(channel);
-            if ((dhcp == EthernetInterface::DHCPConf::both) |
-                (dhcp == EthernetInterface::DHCPConf::v6))
+            unpackFinal(req);
+            if (std::bitset<8> expected(
+                    control & std::bitset<8>(reservedRACCBits));
+                expected.any())
             {
-                expected[IPv6RouterControlFlag::Dynamic] = 1;
+                return responseParamNotSupported();
             }
-            else
-            {
-                expected[IPv6RouterControlFlag::Static] = 1;
-            }
-            if (expected != control)
-            {
-                return responseInvalidFieldRequest();
-            }
+
+            bool enableRA = control[IPv6RouterControlFlag::Dynamic];
+            channelCall<setEthProp<bool>>(channel, "IPv6AcceptRA", enableRA);
+            channelCall<setEthProp<bool>>(channel, "DHCP6", enableRA);
             return responseSuccess();
         }
         case LanParam::IPv6StaticRouter1IP:
         {
-            in6_addr gateway;
-            std::array<uint8_t, sizeof(gateway)> bytes;
-            if (req.unpack(bytes) != 0 || !req.fullyUnpacked())
-            {
-                return responseReqDataLenInvalid();
-            }
-            copyInto(gateway, bytes);
+            auto gateway = unpackT<stdplus::In6Addr>(req);
+            unpackFinal(req);
             channelCall<setGatewayProperty<AF_INET6>>(channel, gateway);
             return responseSuccess();
         }
         case LanParam::IPv6StaticRouter1MAC:
         {
-            ether_addr mac;
-            std::array<uint8_t, sizeof(mac)> bytes;
-            if (req.unpack(bytes) != 0 || !req.fullyUnpacked())
-            {
-                return responseReqDataLenInvalid();
-            }
-            copyInto(mac, bytes);
+            auto mac = unpackT<stdplus::EtherAddr>(req);
+            unpackFinal(req);
             channelCall<reconfigureGatewayMAC<AF_INET6>>(channel, mac);
             return responseSuccess();
         }
         case LanParam::IPv6StaticRouter1PrefixLength:
         {
             uint8_t prefix;
-            if (req.unpack(prefix) != 0 || !req.fullyUnpacked())
+            if (req.unpack(prefix) != 0)
             {
                 return responseReqDataLenInvalid();
             }
+            unpackFinal(req);
             if (prefix != 0)
             {
                 return responseInvalidFieldRequest();
@@ -1686,25 +1107,23 @@ RspType<> setLan(Context::ptr ctx, uint4_t channelBits, uint4_t reserved1,
         }
         case LanParam::IPv6StaticRouter1PrefixValue:
         {
-            std::array<uint8_t, sizeof(in6_addr)> bytes;
-            if (req.unpack(bytes) != 0 || !req.fullyUnpacked())
-            {
-                return responseReqDataLenInvalid();
-            }
+            unpackT<stdplus::In6Addr>(req);
+            unpackFinal(req);
             // Accept any prefix value since our prefix length has to be 0
             return responseSuccess();
         }
         case LanParam::cipherSuitePrivilegeLevels:
         {
-            uint8_t reserved;
+            uint8_t rsvd;
             std::array<uint4_t, ipmi::maxCSRecords> cipherSuitePrivs;
 
-            if (req.unpack(reserved, cipherSuitePrivs) || !req.fullyUnpacked())
+            if (req.unpack(rsvd, cipherSuitePrivs))
             {
                 return responseReqDataLenInvalid();
             }
+            unpackFinal(req);
 
-            if (reserved)
+            if (rsvd)
             {
                 return responseInvalidFieldRequest();
             }
@@ -1724,13 +1143,34 @@ RspType<> setLan(Context::ptr ctx, uint4_t channelBits, uint4_t reserved1,
         }
     }
 
-    if ((parameter >= oemCmdStart) && (parameter <= oemCmdEnd))
+    if (parameter >= oemCmdStart)
     {
         return setLanOem(channel, parameter, req);
     }
 
     req.trailingOk = true;
-    return response(ccParamNotSupported);
+    return responseParamNotSupported();
+}
+
+RspType<> setLan(Context::ptr ctx, uint4_t channelBits, uint4_t reserved1,
+                 uint8_t parameter, message::Payload& req)
+{
+    try
+    {
+        return setLanInt(ctx, channelBits, reserved1, parameter, req);
+    }
+    catch (ipmi::Cc cc)
+    {
+        return response(cc);
+    }
+    catch (const sdbusplus::exception_t& e)
+    {
+        if (std::string_view{InvalidArgument::errName} == e.name())
+        {
+            return responseInvalidFieldRequest();
+        }
+        throw;
+    }
 }
 
 RspType<message::Payload> getLan(Context::ptr ctx, uint4_t channelBits,
@@ -1750,7 +1190,13 @@ RspType<message::Payload> getLan(Context::ptr ctx, uint4_t channelBits,
         static_cast<uint8_t>(channelBits), ctx->channel);
     if (reserved || !isValidChannel(channel))
     {
-        log<level::ERR>("Get Lan - Invalid field in request");
+        lg2::error("Get Lan - Invalid field in request");
+        return responseInvalidFieldRequest();
+    }
+
+    if (!isLanChannel(channel).value_or(false))
+    {
+        lg2::error("Get Lan - Not a LAN channel");
         return responseInvalidFieldRequest();
     }
 
@@ -1764,8 +1210,7 @@ RspType<message::Payload> getLan(Context::ptr ctx, uint4_t channelBits,
             listInit = true;
         }
         catch (const std::exception& e)
-        {
-        }
+        {}
     }
 
     switch (static_cast<LanParam>(parameter))
@@ -1781,7 +1226,7 @@ RspType<message::Payload> getLan(Context::ptr ctx, uint4_t channelBits,
             {
                 status = SetStatus::Complete;
             }
-            ret.pack(static_cast<uint2_t>(status), uint6_t{});
+            ret.pack(types::enum_cast<uint2_t>(status), uint6_t{});
             return responseSuccess(std::move(ret));
         }
         case LanParam::AuthSupport:
@@ -1803,31 +1248,26 @@ RspType<message::Payload> getLan(Context::ptr ctx, uint4_t channelBits,
         case LanParam::IP:
         {
             auto ifaddr = channelCall<getIfAddr4>(channel);
-            in_addr addr{};
+            stdplus::In4Addr addr{};
             if (ifaddr)
             {
                 addr = ifaddr->address;
             }
-            ret.pack(dataRef(addr));
+            ret.pack(stdplus::raw::asView<char>(addr));
             return responseSuccess(std::move(ret));
         }
         case LanParam::IPSrc:
         {
-            auto src = IPSrc::Static;
-            EthernetInterface::DHCPConf dhcp =
-                channelCall<getDHCPProperty>(channel);
-            if ((dhcp == EthernetInterface::DHCPConf::v4) ||
-                (dhcp == EthernetInterface::DHCPConf::both))
-            {
-                src = IPSrc::DHCP;
-            }
-            ret.pack(static_cast<uint4_t>(src), uint4_t{});
+            auto src = channelCall<getEthProp<bool>>(channel, "DHCP4")
+                           ? IPSrc::DHCP
+                           : IPSrc::Static;
+            ret.pack(types::enum_cast<uint4_t>(src), uint4_t{});
             return responseSuccess(std::move(ret));
         }
         case LanParam::MAC:
         {
-            ether_addr mac = channelCall<getMACProperty>(channel);
-            ret.pack(dataRef(mac));
+            auto mac = channelCall<getMACProperty>(channel);
+            ret.pack(stdplus::raw::asView<char>(mac));
             return responseSuccess(std::move(ret));
         }
         case LanParam::SubnetMask:
@@ -1838,27 +1278,26 @@ RspType<message::Payload> getLan(Context::ptr ctx, uint4_t channelBits,
             {
                 prefix = ifaddr->prefix;
             }
-            in_addr netmask = prefixToNetmask(prefix);
-            ret.pack(dataRef(netmask));
+            auto netmask = stdplus::pfxToMask<stdplus::In4Addr>(prefix);
+            ret.pack(stdplus::raw::asView<char>(netmask));
             return responseSuccess(std::move(ret));
         }
         case LanParam::Gateway1:
         {
-            auto gateway =
-                channelCall<getGatewayProperty<AF_INET>>(channel).value_or(
-                    in_addr{});
-            ret.pack(dataRef(gateway));
+            auto gateway = channelCall<getGatewayProperty<AF_INET>>(channel);
+            ret.pack(stdplus::raw::asView<char>(
+                gateway.value_or(stdplus::In4Addr{})));
             return responseSuccess(std::move(ret));
         }
         case LanParam::Gateway1MAC:
         {
-            ether_addr mac{};
+            stdplus::EtherAddr mac{};
             auto neighbor = channelCall<getGatewayNeighbor<AF_INET>>(channel);
             if (neighbor)
             {
                 mac = neighbor->mac;
             }
-            ret.pack(dataRef(mac));
+            ret.pack(stdplus::raw::asView<char>(mac));
             return responseSuccess(std::move(ret));
         }
         case LanParam::VLANId:
@@ -1948,55 +1387,43 @@ RspType<message::Payload> getLan(Context::ptr ctx, uint4_t channelBits,
         case LanParam::IPv6RouterControl:
         {
             std::bitset<8> control;
-            EthernetInterface::DHCPConf dhcp =
-                channelCall<getDHCPProperty>(channel);
-            if ((dhcp == EthernetInterface::DHCPConf::both) ||
-                (dhcp == EthernetInterface::DHCPConf::v6))
-            {
-                control[IPv6RouterControlFlag::Dynamic] = 1;
-            }
-            else
-            {
-                control[IPv6RouterControlFlag::Static] = 1;
-            }
+            control[IPv6RouterControlFlag::Dynamic] =
+                channelCall<getEthProp<bool>>(channel, "IPv6AcceptRA");
+            control[IPv6RouterControlFlag::Static] = 1;
             ret.pack(control);
             return responseSuccess(std::move(ret));
         }
         case LanParam::IPv6StaticRouter1IP:
         {
-            in6_addr gateway{};
-            EthernetInterface::DHCPConf dhcp =
-                channelCall<getDHCPProperty>(channel);
-            if ((dhcp == EthernetInterface::DHCPConf::v4) ||
-                (dhcp == EthernetInterface::DHCPConf::none))
+            stdplus::In6Addr gateway{};
+            if (!channelCall<getEthProp<bool>>(channel, "IPv6AcceptRA"))
             {
                 gateway =
                     channelCall<getGatewayProperty<AF_INET6>>(channel).value_or(
-                        in6_addr{});
+                        stdplus::In6Addr{});
             }
-            ret.pack(dataRef(gateway));
+            ret.pack(stdplus::raw::asView<char>(gateway));
             return responseSuccess(std::move(ret));
         }
         case LanParam::IPv6StaticRouter1MAC:
         {
-            ether_addr mac{};
+            stdplus::EtherAddr mac{};
             auto neighbor = channelCall<getGatewayNeighbor<AF_INET6>>(channel);
             if (neighbor)
             {
                 mac = neighbor->mac;
             }
-            ret.pack(dataRef(mac));
+            ret.pack(stdplus::raw::asView<char>(mac));
             return responseSuccess(std::move(ret));
         }
         case LanParam::IPv6StaticRouter1PrefixLength:
         {
-            ret.pack(UINT8_C(0));
+            ret.pack(uint8_t{0});
             return responseSuccess(std::move(ret));
         }
         case LanParam::IPv6StaticRouter1PrefixValue:
         {
-            in6_addr prefix{};
-            ret.pack(dataRef(prefix));
+            ret.pack(stdplus::raw::asView<char>(stdplus::In6Addr{}));
             return responseSuccess(std::move(ret));
         }
         case LanParam::cipherSuitePrivilegeLevels:
@@ -2019,20 +1446,388 @@ RspType<message::Payload> getLan(Context::ptr ctx, uint4_t channelBits,
         }
     }
 
-    if ((parameter >= oemCmdStart) && (parameter <= oemCmdEnd))
+    if (parameter >= oemCmdStart)
     {
         return getLanOem(channel, parameter, set, block);
     }
 
-    return response(ccParamNotSupported);
+    return responseParamNotSupported();
+}
+
+constexpr const char* solInterface = "xyz.openbmc_project.Ipmi.SOL";
+constexpr const char* solPath = "/xyz/openbmc_project/ipmi/sol/";
+constexpr const uint16_t solDefaultPort = 623;
+
+RspType<> setSolConfParams(Context::ptr ctx, uint4_t channelBits,
+                           uint4_t /*reserved*/, uint8_t parameter,
+                           message::Payload& req)
+{
+    const uint8_t channel = convertCurrentChannelNum(
+        static_cast<uint8_t>(channelBits), ctx->channel);
+
+    if (!isValidChannel(channel))
+    {
+        lg2::error("Set Sol Config - Invalid channel in request");
+        return responseInvalidFieldRequest();
+    }
+
+    auto channelName = ipmi::getChannelName(channel);
+    if (channelName.empty())
+    {
+        lg2::error("Channel name does not exist for channel {CHANNEL}",
+                   "CHANNEL", channel);
+        return responseInvalidFieldRequest();
+    }
+
+    std::string solService{};
+    std::string solPathWithEthName = solPath + channelName;
+
+    if (ipmi::getService(ctx, solInterface, solPathWithEthName, solService))
+    {
+        lg2::error("Set Sol Config - Invalid solInterface, service: {SERVICE}, "
+                   "object path: {OBJPATH}, interface: {INTERFACE}",
+                   "SERVICE", solService, "OBJPATH", solPathWithEthName,
+                   "INTERFACE", solInterface);
+        return responseInvalidFieldRequest();
+    }
+
+    switch (static_cast<SolConfParam>(parameter))
+    {
+        case SolConfParam::Progress:
+        {
+            uint8_t progress;
+            if (req.unpack(progress) != 0 || !req.fullyUnpacked())
+            {
+                return responseReqDataLenInvalid();
+            }
+
+            if (ipmi::setDbusProperty(ctx, solService, solPathWithEthName,
+                                      solInterface, "Progress", progress))
+            {
+                return responseUnspecifiedError();
+            }
+            break;
+        }
+        case SolConfParam::Enable:
+        {
+            bool enable;
+            uint7_t reserved2;
+
+            if (req.unpack(enable, reserved2) != 0 || !req.fullyUnpacked())
+            {
+                return responseReqDataLenInvalid();
+            }
+
+            if (ipmi::setDbusProperty(ctx, solService, solPathWithEthName,
+                                      solInterface, "Enable", enable))
+            {
+                return responseUnspecifiedError();
+            }
+            break;
+        }
+        case SolConfParam::Authentication:
+        {
+            uint4_t privilegeBits{};
+            uint2_t reserved2{};
+            bool forceAuth = false;
+            bool forceEncrypt = false;
+
+            if (req.unpack(privilegeBits, reserved2, forceAuth, forceEncrypt) !=
+                    0 ||
+                !req.fullyUnpacked())
+            {
+                return responseReqDataLenInvalid();
+            }
+
+            uint8_t privilege = static_cast<uint8_t>(privilegeBits);
+            if (privilege < static_cast<uint8_t>(Privilege::User) ||
+                privilege > static_cast<uint8_t>(Privilege::Oem))
+            {
+                return ipmi::responseInvalidFieldRequest();
+            }
+
+            if (ipmi::setDbusProperty(ctx, solService, solPathWithEthName,
+                                      solInterface, "Privilege", privilege))
+            {
+                return responseUnspecifiedError();
+            }
+
+            if (ipmi::setDbusProperty(ctx, solService, solPathWithEthName,
+                                      solInterface, "ForceEncryption",
+                                      forceEncrypt))
+            {
+                return responseUnspecifiedError();
+            }
+
+            if (ipmi::setDbusProperty(ctx, solService, solPathWithEthName,
+                                      solInterface, "ForceAuthentication",
+                                      forceAuth))
+            {
+                return responseUnspecifiedError();
+            }
+            break;
+        }
+        case SolConfParam::Accumulate:
+        {
+            uint8_t interval;
+            uint8_t threshold;
+            if (req.unpack(interval, threshold) != 0 || !req.fullyUnpacked())
+            {
+                return responseReqDataLenInvalid();
+            }
+
+            if (threshold == 0)
+            {
+                return responseInvalidFieldRequest();
+            }
+
+            if (ipmi::setDbusProperty(ctx, solService, solPathWithEthName,
+                                      solInterface, "AccumulateIntervalMS",
+                                      interval))
+            {
+                return responseUnspecifiedError();
+            }
+
+            if (ipmi::setDbusProperty(ctx, solService, solPathWithEthName,
+                                      solInterface, "Threshold", threshold))
+            {
+                return responseUnspecifiedError();
+            }
+            break;
+        }
+        case SolConfParam::Retry:
+        {
+            uint3_t countBits;
+            uint5_t reserved2;
+            uint8_t interval;
+
+            if (req.unpack(countBits, reserved2, interval) != 0 ||
+                !req.fullyUnpacked())
+            {
+                return responseReqDataLenInvalid();
+            }
+
+            uint8_t count = static_cast<uint8_t>(countBits);
+            if (ipmi::setDbusProperty(ctx, solService, solPathWithEthName,
+                                      solInterface, "RetryCount", count))
+            {
+                return responseUnspecifiedError();
+            }
+
+            if (ipmi::setDbusProperty(ctx, solService, solPathWithEthName,
+                                      solInterface, "RetryIntervalMS",
+                                      interval))
+            {
+                return responseUnspecifiedError();
+            }
+            break;
+        }
+        case SolConfParam::Port:
+        {
+            return responseWriteReadParameter();
+        }
+        case SolConfParam::NonVbitrate:
+        case SolConfParam::Vbitrate:
+        case SolConfParam::Channel:
+        default:
+            return responseParamNotSupported();
+    }
+    return responseSuccess();
+}
+
+RspType<message::Payload> getSolConfParams(
+    Context::ptr ctx, uint4_t channelBits, uint3_t /*reserved*/, bool revOnly,
+    uint8_t parameter, uint8_t /*set*/, uint8_t /*block*/)
+{
+    message::Payload ret;
+    constexpr uint8_t current_revision = 0x11;
+    ret.pack(current_revision);
+    if (revOnly)
+    {
+        return responseSuccess(std::move(ret));
+    }
+
+    const uint8_t channel = convertCurrentChannelNum(
+        static_cast<uint8_t>(channelBits), ctx->channel);
+
+    if (!isValidChannel(channel))
+    {
+        lg2::error("Get Sol Config - Invalid channel in request");
+        return responseInvalidFieldRequest();
+    }
+
+    auto channelName = ipmi::getChannelName(channel);
+    if (channelName.empty())
+    {
+        lg2::error("Channel name does not exist for channel {CHANNEL}",
+                   "CHANNEL", channel);
+        return responseInvalidFieldRequest();
+    }
+
+    std::string solService{};
+    std::string solPathWithEthName = solPath + channelName;
+
+    if (ipmi::getService(ctx, solInterface, solPathWithEthName, solService))
+    {
+        lg2::error("Get Sol Config - Invalid solInterface, service: {SERVICE}, "
+                   "object path: {OBJPATH}, interface: {INTERFACE}",
+                   "SERVICE", solService, "OBJPATH", solPathWithEthName,
+                   "INTERFACE", solInterface);
+        return responseInvalidFieldRequest();
+    }
+
+    switch (static_cast<SolConfParam>(parameter))
+    {
+        case SolConfParam::Progress:
+        {
+            uint8_t progress;
+            if (ipmi::getDbusProperty(ctx, solService, solPathWithEthName,
+                                      solInterface, "Progress", progress))
+            {
+                return responseUnspecifiedError();
+            }
+            ret.pack(progress);
+            return responseSuccess(std::move(ret));
+        }
+        case SolConfParam::Enable:
+        {
+            bool enable{};
+            if (ipmi::getDbusProperty(ctx, solService, solPathWithEthName,
+                                      solInterface, "Enable", enable))
+            {
+                return responseUnspecifiedError();
+            }
+            ret.pack(enable, uint7_t{});
+            return responseSuccess(std::move(ret));
+        }
+        case SolConfParam::Authentication:
+        {
+            // 4bits, cast when pack
+            uint8_t privilege;
+            bool forceAuth = false;
+            bool forceEncrypt = false;
+
+            if (ipmi::getDbusProperty(ctx, solService, solPathWithEthName,
+                                      solInterface, "Privilege", privilege))
+            {
+                return responseUnspecifiedError();
+            }
+
+            if (ipmi::getDbusProperty(ctx, solService, solPathWithEthName,
+                                      solInterface, "ForceAuthentication",
+                                      forceAuth))
+            {
+                return responseUnspecifiedError();
+            }
+
+            if (ipmi::getDbusProperty(ctx, solService, solPathWithEthName,
+                                      solInterface, "ForceEncryption",
+                                      forceEncrypt))
+            {
+                return responseUnspecifiedError();
+            }
+            ret.pack(uint4_t{privilege}, uint2_t{}, forceAuth, forceEncrypt);
+            return responseSuccess(std::move(ret));
+        }
+        case SolConfParam::Accumulate:
+        {
+            uint8_t interval{}, threshold{};
+
+            if (ipmi::getDbusProperty(ctx, solService, solPathWithEthName,
+                                      solInterface, "AccumulateIntervalMS",
+                                      interval))
+            {
+                return responseUnspecifiedError();
+            }
+
+            if (ipmi::getDbusProperty(ctx, solService, solPathWithEthName,
+                                      solInterface, "Threshold", threshold))
+            {
+                return responseUnspecifiedError();
+            }
+            ret.pack(interval, threshold);
+            return responseSuccess(std::move(ret));
+        }
+        case SolConfParam::Retry:
+        {
+            // 3bits, cast when pack
+            uint8_t count{};
+            uint8_t interval{};
+
+            if (ipmi::getDbusProperty(ctx, solService, solPathWithEthName,
+                                      solInterface, "RetryCount", count))
+            {
+                return responseUnspecifiedError();
+            }
+
+            if (ipmi::getDbusProperty(ctx, solService, solPathWithEthName,
+                                      solInterface, "RetryIntervalMS",
+                                      interval))
+            {
+                return responseUnspecifiedError();
+            }
+            ret.pack(uint3_t{count}, uint5_t{}, interval);
+            return responseSuccess(std::move(ret));
+        }
+        case SolConfParam::Port:
+        {
+            auto port = solDefaultPort;
+            ret.pack(static_cast<uint16_t>(port));
+            return responseSuccess(std::move(ret));
+        }
+        case SolConfParam::Channel:
+        {
+            ret.pack(channel);
+            return responseSuccess(std::move(ret));
+        }
+        case SolConfParam::NonVbitrate:
+        {
+            uint64_t baudRate;
+            uint8_t encodedBitRate = 0;
+            if (ipmi::getDbusProperty(
+                    ctx, "xyz.openbmc_project.Console.default",
+                    "/xyz/openbmc_project/console/default",
+                    "xyz.openbmc_project.Console.UART", "Baud", baudRate))
+            {
+                return responseParamNotSupported();
+            }
+            switch (baudRate)
+            {
+                case 9600:
+                    encodedBitRate = 0x06;
+                    break;
+                case 19200:
+                    encodedBitRate = 0x07;
+                    break;
+                case 38400:
+                    encodedBitRate = 0x08;
+                    break;
+                case 57600:
+                    encodedBitRate = 0x09;
+                    break;
+                case 115200:
+                    encodedBitRate = 0x0a;
+                    break;
+                default:
+                    break;
+            }
+            ret.pack(encodedBitRate);
+            return responseSuccess(std::move(ret));
+        }
+        case SolConfParam::Vbitrate:
+        default:
+            return responseParamNotSupported();
+    }
+
+    return responseParamNotSupported();
 }
 
 } // namespace transport
 } // namespace ipmi
 
-void register_netfn_transport_functions() __attribute__((constructor));
+void registerNetFnTransportFunctions() __attribute__((constructor));
 
-void register_netfn_transport_functions()
+void registerNetFnTransportFunctions()
 {
     ipmi::registerHandler(ipmi::prioOpenBmcBase, ipmi::netFnTransport,
                           ipmi::transport::cmdSetLanConfigParameters,
@@ -2040,4 +1835,12 @@ void register_netfn_transport_functions()
     ipmi::registerHandler(ipmi::prioOpenBmcBase, ipmi::netFnTransport,
                           ipmi::transport::cmdGetLanConfigParameters,
                           ipmi::Privilege::Operator, ipmi::transport::getLan);
+    ipmi::registerHandler(ipmi::prioOpenBmcBase, ipmi::netFnTransport,
+                          ipmi::transport::cmdSetSolConfigParameters,
+                          ipmi::Privilege::Admin,
+                          ipmi::transport::setSolConfParams);
+    ipmi::registerHandler(ipmi::prioOpenBmcBase, ipmi::netFnTransport,
+                          ipmi::transport::cmdGetSolConfigParameters,
+                          ipmi::Privilege::User,
+                          ipmi::transport::getSolConfParams);
 }

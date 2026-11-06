@@ -15,8 +15,9 @@
  *
  */
 #pragma once
-#include <cstdint>
 #include <ipmid/iana.hpp>
+
+#include <cstdint>
 #include <optional>
 #include <tuple>
 
@@ -30,6 +31,10 @@ constexpr Group groupPICMG = 0x00;
 constexpr Group groupDMTG = 0x01;
 constexpr Group groupSSI = 0x02;
 constexpr Group groupVSO = 0x03;
+constexpr Group groupRedfish = 0x52;
+#ifdef ARM_SBMR_SUPPORT
+constexpr Group groupSBMR = 0xAE;
+#endif
 constexpr Group groupDCMI = 0xDC;
 
 /*
@@ -326,6 +331,14 @@ constexpr Cmd cmdSetDcmiConfigParameters = 0x12;
 constexpr Cmd cmdGetDcmiConfigParameters = 0x13;
 } // namespace dcmi
 
+#ifdef ARM_SBMR_SUPPORT
+namespace sbmr
+{
+constexpr Cmd cmdSendBootProgressCode = 0x02;
+constexpr Cmd cmdGetBootProgressCode = 0x03;
+} // namespace sbmr
+#endif
+
 // These are the command network functions, the response
 // network functions are the function + 1. So to determine
 // the proper network function which issued the command
@@ -368,7 +381,7 @@ constexpr Cc ccSuccess = 0x00;
 constexpr Cc ccBusy = 0xC0;
 constexpr Cc ccInvalidCommand = 0xC1;
 constexpr Cc ccInvalidCommandOnLun = 0xC2;
-constexpr Cc ccTimeout = 0xC2;
+constexpr Cc ccTimeout = 0xC3;
 constexpr Cc ccOutOfSpace = 0xC4;
 constexpr Cc ccInvalidReservationId = 0xC5;
 constexpr Cc ccReqDataTruncated = 0xC6;

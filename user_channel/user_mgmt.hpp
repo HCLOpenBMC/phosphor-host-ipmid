@@ -1,4 +1,4 @@
-/*
+/*.
 // Copyright (c) 2018 Intel Corporation
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,19 +18,106 @@
 
 #include <boost/interprocess/sync/file_lock.hpp>
 #include <boost/interprocess/sync/named_recursive_mutex.hpp>
-#include <cstdint>
-#include <ctime>
 #include <ipmid/api.hpp>
 #include <sdbusplus/bus.hpp>
+
+#include <algorithm>
+#include <cstdint>
+#include <cstring>
+#include <ctime>
 #include <variant>
 
 namespace ipmi
 {
 
+static constexpr const char* dBusPropertiesInterface =
+    "org.freedesktop.DBus.Properties";
+static constexpr const char* getAllPropertiesMethod = "GetAll";
+static constexpr const char* propertiesChangedSignal = "PropertiesChanged";
+static constexpr const char* setPropertiesMethod = "Set";
+
+// Object Manager related
+static constexpr const char* dBusObjManager =
+    "org.freedesktop.DBus.ObjectManager";
+static constexpr const char* getManagedObjectsMethod = "GetManagedObjects";
+// Object Manager signals
+static constexpr const char* intfAddedSignal = "InterfacesAdded";
+static constexpr const char* intfRemovedSignal = "InterfacesRemoved";
+
+static constexpr const char* ipmiUserMutex = "ipmi_usr_mutex";
+static constexpr const char* ipmiMutexCleanupLockFile =
+    "/run/ipmi/ipmi_usr_mutex_cleanup";
+static constexpr const char* ipmiUserSignalLockFile =
+    "/run/ipmi/ipmi_usr_signal_mutex";
+static constexpr const char* ipmiUserDataFile = "/var/lib/ipmi/ipmi_user.json";
+static constexpr const char* ipmiGrpName = "ipmi";
+static constexpr size_t privNoAccess = 0xF;
+static constexpr size_t privMask = 0xF;
+
+// User manager related
+static constexpr const char* userMgrService =
+    "xyz.openbmc_project.User.Manager";
+static constexpr const char* userMgrObjBasePath = "/xyz/openbmc_project/user";
+static constexpr const char* userObjBasePath = "/xyz/openbmc_project/user";
+static constexpr const char* userMgrInterface =
+    "xyz.openbmc_project.User.Manager";
+static constexpr const char* usersInterface =
+    "xyz.openbmc_project.User.Attributes";
+static constexpr const char* deleteUserInterface =
+    "xyz.openbmc_project.Object.Delete";
+
+static constexpr const char* createUserMethod = "CreateUser";
+static constexpr const char* deleteUserMethod = "Delete";
+static constexpr const char* renameUserMethod = "RenameUser";
+// User manager signal members
+static constexpr const char* userRenamedSignal = "UserRenamed";
+// Mgr interface properties
+static constexpr const char* allPrivProperty = "AllPrivileges";
+static constexpr const char* allGrpProperty = "AllGroups";
+// User interface properties
+static constexpr const char* userPrivProperty = "UserPrivilege";
+static constexpr const char* userGrpProperty = "UserGroups";
+static constexpr const char* userEnabledProperty = "UserEnabled";
+
+static std::array<std::string, (PRIVILEGE_OEM + 1)> ipmiPrivIndex = {
+    "priv-reserved", // PRIVILEGE_RESERVED - 0
+    "priv-callback", // PRIVILEGE_CALLBACK - 1
+    "priv-user",     // PRIVILEGE_USER - 2
+    "priv-operator", // PRIVILEGE_OPERATOR - 3
+    "priv-admin",    // PRIVILEGE_ADMIN - 4
+    "priv-custom"    // PRIVILEGE_OEM - 5
+};
+
+// Inline functions for safe username buffer operations
+inline size_t safeUsernameLength(const uint8_t* buf)
+{
+    return strnlen(reinterpret_cast<const char*>(buf), ipmiMaxUserName);
+}
+
+inline std::string safeUsernameString(const uint8_t* buf)
+{
+    return std::string(reinterpret_cast<const char*>(buf),
+                       safeUsernameLength(buf));
+}
+
+inline void safeUsernameAssign(std::string& str, const uint8_t* buf)
+{
+    size_t len = safeUsernameLength(buf);
+    str.assign(reinterpret_cast<const char*>(buf), len);
+}
+
+inline void safeUsernameCopyToBuffer(uint8_t* buf, size_t bufSize,
+                                     const std::string& str)
+{
+    std::memset(buf, 0, bufSize);
+    const size_t n = std::min(str.size(), bufSize);
+    std::memcpy(buf, str.data(), n);
+}
+
 using DbusUserPropVariant =
     std::variant<std::vector<std::string>, std::string, bool>;
 
-using DbusUserObjPath = sdbusplus::message::object_path;
+using DbusUserObjPath = sdbusplus::object_path;
 
 using DbusUserObjProperties =
     std::vector<std::pair<std::string, DbusUserPropVariant>>;
@@ -86,16 +173,6 @@ struct UsersTbl
     //+1 to map with UserId directly. UserId 0 is reserved.
     UserInfo user[ipmiMaxUsers + 1];
 };
-
-/** @brief PAM User Authentication check
- *
- *  @param[in] username - username in string
- *  @param[in] password	- password in string
- *
- *  @return status
- */
-bool pamUserCheckAuthenticate(std::string_view username,
-                              std::string_view password);
 
 class UserAccess;
 
@@ -241,7 +318,7 @@ class UserAccess
      *  @return ccSuccess for success, others for failure.
      */
     Cc setSpecialUserPassword(const std::string& userName,
-                              const std::string& userPassword);
+                              const SecureString& userPassword);
 
     /** @brief to set user privilege and access details
      *
@@ -316,7 +393,12 @@ class UserAccess
      */
     void writeUserData();
 
-    /** @brief Funtion which checks and reload configuration file data if
+    /** @brief initializes user data file with default values
+     *
+     */
+    void initializeUserDataFile();
+
+    /** @brief Function which checks and reload configuration file data if
      * needed.
      *
      */
@@ -371,6 +453,30 @@ class UserAccess
      */
     UsersTbl* getUsersTblPtr();
 
+    /** @brief function to get all User available groups
+     *
+     */
+    const std::vector<std::string>& getUsersAllAvailableGroup();
+
+    /** @brief determines valid user group access
+     *
+     *  @param[in] groupAccess - List of groupAccess
+     *
+     *  @return true if valid, false otherwise
+     */
+    bool isValidGroups(const std::vector<std::string>& groupAccess);
+
+    /** @brief sets user group access data
+     *
+     *  @param[in] userId - user id
+     *  @param[in] chNum - channel number
+     *  @param[in] groups - groups data
+     *
+     *  @return ccSuccess for success, others for failure.
+     */
+    Cc setUserGroups(const uint8_t userId, const uint8_t chNum,
+                     const std::vector<std::string>& groupAccess);
+
     std::unique_ptr<boost::interprocess::named_recursive_mutex> userMutex{
         nullptr};
 
@@ -378,8 +484,8 @@ class UserAccess
     UsersTbl usersTbl;
     std::vector<std::string> availablePrivileges;
     std::vector<std::string> availableGroups;
-    sdbusplus::bus::bus bus;
-    std::time_t fileLastUpdatedTime;
+    sdbusplus::bus_t bus;
+    std::timespec fileLastUpdatedTime;
     bool signalHndlrObject = false;
     boost::interprocess::file_lock sigHndlrLock;
     boost::interprocess::file_lock mutexCleanupLock;
@@ -388,7 +494,7 @@ class UserAccess
      *
      *  @return time stamp or -EIO for failure
      */
-    std::time_t getUpdatedFileTime();
+    std::timespec getUpdatedFileTime();
 
     /** @brief function to available system privileges and groups
      *
@@ -401,4 +507,5 @@ class UserAccess
      */
     void cacheUserDataFile();
 };
+
 } // namespace ipmi

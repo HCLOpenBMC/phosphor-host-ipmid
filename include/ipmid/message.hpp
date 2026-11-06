@@ -15,15 +15,17 @@
  */
 #pragma once
 
-#include <algorithm>
 #include <boost/asio/spawn.hpp>
-#include <cstdint>
-#include <exception>
 #include <ipmid/api-types.hpp>
 #include <ipmid/message/types.hpp>
-#include <memory>
-#include <phosphor-logging/log.hpp>
+#include <ipmid/types.hpp>
+#include <phosphor-logging/lg2.hpp>
 #include <sdbusplus/asio/connection.hpp>
+
+#include <algorithm>
+#include <cstdint>
+#include <exception>
+#include <memory>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -45,12 +47,10 @@ struct Context
             uint8_t lun, Cmd cmd, int channel, int userId, uint32_t sessionId,
             Privilege priv, int rqSA, int hostIdx,
             boost::asio::yield_context& yield) :
-        bus(bus),
-        netFn(netFn), lun(lun), cmd(cmd), channel(channel), userId(userId),
-        sessionId(sessionId), priv(priv), rqSA(rqSA), hostIdx(hostIdx),
-        yield(yield)
-    {
-    }
+        bus(bus), netFn(netFn), lun(lun), cmd(cmd), channel(channel),
+        userId(userId), sessionId(sessionId), priv(priv), group(0), rqSA(rqSA),
+        hostIdx(hostIdx), yield(yield)
+    {}
 
     std::shared_ptr<sdbusplus::asio::connection> bus;
     // normal IPMI context (what call is this, from whence it came...)
@@ -61,6 +61,8 @@ struct Context
     int userId;
     uint32_t sessionId;
     Privilege priv;
+    // defining body code for netFnGroup
+    Group group;
     // srcAddr is only set on IPMB requests because
     // Platform Event Message needs it to determine the incoming format
     int rqSA;
@@ -115,17 +117,16 @@ struct Payload
     Payload(Payload&&) = default;
     Payload& operator=(Payload&&) = default;
 
-    explicit Payload(std::vector<uint8_t>&& data) : raw(std::move(data))
-    {
-    }
+    explicit Payload(SecureBuffer&& data) : raw(std::move(data)) {}
 
     ~Payload()
     {
-        using namespace phosphor::logging;
         if (raw.size() != 0 && std::uncaught_exceptions() == 0 && !trailingOk &&
             !unpackCheck && !unpackError)
         {
-            log<level::ERR>("Failed to check request for full unpack");
+            lg2::error(
+                "Failed to check request for full unpack: raw size: {RAW_SIZE}",
+                "RAW_SIZE", raw.size());
         }
     }
 
@@ -276,7 +277,7 @@ struct Payload
      *
      * @param p - The payload to prepend
      *
-     * @retunr int - non-zero on prepend errors
+     * @return int - non-zero on prepend errors
      */
     int prepend(const ipmi::message::Payload& p)
     {
@@ -480,7 +481,7 @@ struct Payload
     // partial bytes in the form of bits
     fixed_uint_t<details::bitStreamSize> bitStream;
     size_t bitCount = 0;
-    std::vector<uint8_t> raw;
+    SecureBuffer raw;
     size_t rawIndex = 0;
     bool trailingOk = true;
     bool unpackCheck = false;
@@ -514,8 +515,7 @@ struct Response
 
     explicit Response(Context::ptr& context) :
         payload(), ctx(context), cc(ccSuccess)
-    {
-    }
+    {}
 
     /**
      * @brief pack arbitrary values (of any supported type) into the payload
@@ -558,7 +558,7 @@ struct Response
      *
      * @param p - The payload to prepend
      *
-     * @retunr int - non-zero on prepend errors
+     * @return int - non-zero on prepend errors
      */
     int prepend(const ipmi::message::Payload& p)
     {
@@ -594,10 +594,9 @@ struct Request
 
     using ptr = std::shared_ptr<Request>;
 
-    explicit Request(Context::ptr context, std::vector<uint8_t>&& d) :
-        payload(std::forward<std::vector<uint8_t>>(d)), ctx(context)
-    {
-    }
+    explicit Request(Context::ptr context, SecureBuffer&& d) :
+        payload(std::forward<SecureBuffer>(d)), ctx(context)
+    {}
 
     /**
      * @brief unpack arbitrary values (of any supported type) from the payload

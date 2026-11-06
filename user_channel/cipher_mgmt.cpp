@@ -20,14 +20,14 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include <phosphor-logging/lg2.hpp>
+
 #include <filesystem>
 #include <fstream>
-#include <phosphor-logging/log.hpp>
 
 namespace ipmi
 {
 
-using namespace phosphor::logging;
 using Json = nlohmann::json;
 namespace fs = std::filesystem;
 
@@ -50,7 +50,7 @@ void CipherConfig::loadCSPrivilegesToMap()
 {
     if (!fs::exists(cipherSuiteDefaultPrivFileName))
     {
-        log<level::ERR>("CS privilege levels default file does not exist...");
+        lg2::error("CS privilege levels default file does not exist...");
     }
     else
     {
@@ -97,7 +97,7 @@ Json CipherConfig::readCSPrivilegeLevels(const std::string& csFileName)
     std::ifstream jsonFile(csFileName);
     if (!jsonFile.good())
     {
-        log<level::ERR>("JSON file not found");
+        lg2::error("JSON file not found");
         return nullptr;
     }
 
@@ -106,10 +106,11 @@ Json CipherConfig::readCSPrivilegeLevels(const std::string& csFileName)
     {
         data = Json::parse(jsonFile, nullptr, false);
     }
-    catch (Json::parse_error& e)
+    catch (const Json::parse_error& e)
     {
-        log<level::ERR>("Corrupted cipher suite privilege levels config file.",
-                        entry("MSG: %s", e.what()));
+        lg2::error(
+            "Corrupted cipher suite privilege levels config file: {ERROR}",
+            "ERROR", e);
     }
 
     return data;
@@ -120,35 +121,42 @@ int CipherConfig::writeCSPrivilegeLevels(const Json& jsonData)
     std::string tmpFile =
         static_cast<std::string>(cipherSuitePrivFileName) + "_tmpXXXXXX";
 
-    char tmpRandomFile[tmpFile.length() + 1];
-    strncpy(tmpRandomFile, tmpFile.c_str(), tmpFile.length() + 1);
+    std::vector<char> tmpRandomFile(tmpFile.length() + 1);
+    strncpy(tmpRandomFile.data(), tmpFile.c_str(), tmpFile.length() + 1);
 
-    int fd = mkstemp(tmpRandomFile);
-    fchmod(fd, 0644);
-
+    int fd = mkstemp(tmpRandomFile.data());
     if (fd < 0)
     {
-        log<level::ERR>("Error opening CS privilege level config file",
-                        entry("FILE_NAME=%s", tmpFile.c_str()));
+        lg2::error("Error opening CS privilege level config file: {FILE_NAME}",
+                   "FILE_NAME", tmpFile);
         return -EIO;
     }
-    const auto& writeData = jsonData.dump();
+    const auto& writeData = jsonData.dump(4);
     if (write(fd, writeData.c_str(), writeData.size()) !=
         static_cast<ssize_t>(writeData.size()))
     {
         close(fd);
-        log<level::ERR>("Error writing CS privilege level config file",
-                        entry("FILE_NAME=%s", tmpFile.c_str()));
-        unlink(tmpRandomFile);
+        lg2::error("Error writing CS privilege level config file: {FILE_NAME}",
+                   "FILE_NAME", tmpFile);
+        unlink(tmpRandomFile.data());
+        return -EIO;
+    }
+    if (fchmod(fd, 0644) < 0)
+    {
+        close(fd);
+        lg2::error(
+            "Error setting permissions on CS privilege level config file: {FILE_NAME}",
+            "FILE_NAME", tmpFile);
+        unlink(tmpRandomFile.data());
         return -EIO;
     }
     close(fd);
 
-    if (std::rename(tmpRandomFile, cipherSuitePrivFileName.c_str()))
+    if (std::rename(tmpRandomFile.data(), cipherSuitePrivFileName.c_str()))
     {
-        log<level::ERR>("Error renaming CS privilege level config file",
-                        entry("FILE_NAME=%s", tmpFile.c_str()));
-        unlink(tmpRandomFile);
+        lg2::error("Error renaming CS privilege level config file: {FILE_NAME}",
+                   "FILE_NAME", tmpFile);
+        unlink(tmpRandomFile.data());
         return -EIO;
     }
 
@@ -160,8 +168,7 @@ uint4_t CipherConfig::convertToPrivLimitIndex(const std::string& value)
     auto iter = std::find(ipmi::privList.begin(), ipmi::privList.end(), value);
     if (iter == privList.end())
     {
-        log<level::ERR>("Invalid privilege.",
-                        entry("PRIV_STR=%s", value.c_str()));
+        lg2::error("Invalid privilege: {PRIV_STR}", "PRIV_STR", value);
         return ccUnspecifiedError;
     }
 
@@ -178,7 +185,9 @@ ipmi::Cc CipherConfig::getCSPrivilegeLevels(
 {
     if (!isValidChannel(chNum))
     {
-        log<level::ERR>("Invalid channel number", entry("CHANNEL=%u", chNum));
+        lg2::error(
+            "Get CS Privilege levels - Invalid channel number: {CHANNEL}",
+            "CHANNEL", chNum);
         return ccInvalidFieldRequest;
     }
 
@@ -194,15 +203,17 @@ ipmi::Cc CipherConfig::setCSPrivilegeLevels(
 {
     if (!isValidChannel(chNum))
     {
-        log<level::ERR>("Invalid channel number", entry("CHANNEL=%u", chNum));
+        lg2::error(
+            "Set CS Privilege levels - Invalid channel number: {CHANNEL}",
+            "CHANNEL", chNum);
         return ccInvalidFieldRequest;
     }
 
     Json jsonData;
     if (!fs::exists(cipherSuitePrivFileName))
     {
-        log<level::INFO>("CS privilege levels user settings file does not "
-                         "exist. Creating...");
+        lg2::info("CS privilege levels user settings file does not "
+                  "exist. Creating...");
     }
     else
     {
@@ -233,7 +244,7 @@ ipmi::Cc CipherConfig::setCSPrivilegeLevels(
 
     if (writeCSPrivilegeLevels(jsonData))
     {
-        log<level::ERR>("Error in setting CS Privilege Levels.");
+        lg2::error("Error in setting CS Privilege Levels.");
         return ccUnspecifiedError;
     }
 

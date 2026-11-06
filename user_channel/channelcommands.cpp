@@ -14,17 +14,22 @@
 // limitations under the License.
 */
 
-#include "apphandler.hpp"
 #include "channel_layer.hpp"
 
 #include <ipmid/api.hpp>
-#include <phosphor-logging/log.hpp>
-#include <regex>
+#include <phosphor-logging/lg2.hpp>
 
-using namespace phosphor::logging;
+#include <regex>
 
 namespace ipmi
 {
+
+constexpr Cc ccPayloadTypeNotSupported = 0x80;
+
+static inline auto responsePayloadTypeNotSupported()
+{
+    return response(ccPayloadTypeNotSupported);
+}
 
 /** @brief implements the set channel access command
  *  @ param ctx - context pointer
@@ -37,20 +42,19 @@ namespace ipmi
  *  @ param chanAccess - channel access
  *  @ param channelPrivLimit - channel privilege limit
  *  @ param reserved - skip 3 bits
- *  @ param channelPrivMode - channel priviledge mode
+ *  @ param channelPrivMode - channel privilege mode
  *
  *  @ returns IPMI completion code
  **/
-RspType<> ipmiSetChannelAccess(Context::ptr ctx, uint4_t channel,
-                               uint4_t reserved1, uint3_t accessMode,
-                               bool usrAuth, bool msgAuth, bool alertDisabled,
-                               uint2_t chanAccess, uint4_t channelPrivLimit,
-                               uint2_t reserved2, uint2_t channelPrivMode)
+RspType<> ipmiSetChannelAccess(
+    Context::ptr ctx, uint4_t channel, uint4_t reserved1, uint3_t accessMode,
+    bool usrAuth, bool msgAuth, bool alertDisabled, uint2_t chanAccess,
+    uint4_t channelPrivLimit, uint2_t reserved2, uint2_t channelPrivMode)
 {
     if (reserved1 || reserved2 ||
         !isValidPrivLimit(static_cast<uint8_t>(channelPrivLimit)))
     {
-        log<level::DEBUG>("Set channel access - Invalid field in request");
+        lg2::debug("Set channel access - Invalid field in request");
         return responseInvalidFieldRequest();
     }
 
@@ -59,8 +63,9 @@ RspType<> ipmiSetChannelAccess(Context::ptr ctx, uint4_t channel,
     if ((getChannelSessionSupport(chNum) == EChannelSessSupported::none) ||
         (!isValidChannel(chNum)))
     {
-        log<level::DEBUG>("Set channel access - No support on channel");
-        return response(ccActionNotSupportedForChannel);
+        lg2::debug("Set channel access - No support on channel: {CHANNEL}",
+                   "CHANNEL", chNum);
+        return responseActionNotSupportedForChannel();
     }
 
     ChannelAccess chActData;
@@ -76,6 +81,12 @@ RspType<> ipmiSetChannelAccess(Context::ptr ctx, uint4_t channel,
         case doNotSet:
             break;
         case nvData:
+            getChannelAccessPersistData(chNum, chNVData);
+            if (chNVData.accessMode != accessMode)
+            {
+                lg2::debug("Set channel access - Invalid access set mode");
+                return responseAccessModeNotSupportedForChannel();
+            }
             chNVData.accessMode = static_cast<uint8_t>(accessMode);
             chNVData.userAuthDisabled = usrAuth;
             chNVData.perMsgAuthDisabled = msgAuth;
@@ -85,6 +96,12 @@ RspType<> ipmiSetChannelAccess(Context::ptr ctx, uint4_t channel,
             break;
 
         case activeData:
+            getChannelAccessData(chNum, chActData);
+            if (chActData.accessMode != accessMode)
+            {
+                lg2::debug("Set channel access - Invalid access set mode");
+                return responseAccessModeNotSupportedForChannel();
+            }
             chActData.accessMode = static_cast<uint8_t>(accessMode);
             chActData.userAuthDisabled = usrAuth;
             chActData.perMsgAuthDisabled = msgAuth;
@@ -95,8 +112,8 @@ RspType<> ipmiSetChannelAccess(Context::ptr ctx, uint4_t channel,
 
         case reserved:
         default:
-            log<level::DEBUG>("Set channel access - Invalid access set mode");
-            return response(ccAccessModeNotSupportedForChannel);
+            lg2::debug("Set channel access - Invalid access set mode");
+            return responseAccessModeNotSupportedForChannel();
     }
 
     // cannot static cast directly from uint2_t to enum; must go via int
@@ -116,8 +133,8 @@ RspType<> ipmiSetChannelAccess(Context::ptr ctx, uint4_t channel,
             break;
         case reserved:
         default:
-            log<level::DEBUG>("Set channel access - Invalid access priv mode");
-            return response(ccAccessModeNotSupportedForChannel);
+            lg2::debug("Set channel access - Invalid access priv mode");
+            return responseAccessModeNotSupportedForChannel();
     }
 
     if (setNVFlag != 0)
@@ -125,7 +142,7 @@ RspType<> ipmiSetChannelAccess(Context::ptr ctx, uint4_t channel,
         compCode = setChannelAccessPersistData(chNum, chNVData, setNVFlag);
         if (compCode != ccSuccess)
         {
-            log<level::DEBUG>("Set channel access - Failed to set access data");
+            lg2::debug("Set channel access - Failed to set access data");
             return response(compCode);
         }
     }
@@ -135,7 +152,7 @@ RspType<> ipmiSetChannelAccess(Context::ptr ctx, uint4_t channel,
         compCode = setChannelAccessData(chNum, chActData, setActFlag);
         if (compCode != ccSuccess)
         {
-            log<level::DEBUG>("Set channel access - Failed to set access data");
+            lg2::debug("Set channel access - Failed to set access data");
             return response(compCode);
         }
     }
@@ -159,27 +176,28 @@ RspType<> ipmiSetChannelAccess(Context::ptr ctx, uint4_t channel,
  *  - privLimit - channel privilege limit
  *  - reserved - skip 4 bits
  * */
-ipmi ::RspType<uint3_t, // access mode,
-               bool,    // user authentication status,
-               bool,    // message authentication status,
-               bool,    // alerting status,
-               uint2_t, // reserved,
+ipmi::RspType<uint3_t, // access mode,
+              bool,    // user authentication status,
+              bool,    // message authentication status,
+              bool,    // alerting status,
+              uint2_t, // reserved,
 
-               uint4_t, // channel privilege,
-               uint4_t  // reserved
-               >
+              uint4_t, // channel privilege,
+              uint4_t  // reserved
+              >
     ipmiGetChannelAccess(Context::ptr ctx, uint4_t channel, uint4_t reserved1,
                          uint6_t reserved2, uint2_t accessSetMode)
 {
     if (reserved1 || reserved2)
     {
-        log<level::DEBUG>("Get channel access - Invalid field in request");
+        lg2::debug("Get channel access - Invalid field in request");
         return responseInvalidFieldRequest();
     }
 
-    if ((accessSetMode == doNotSet) || (accessSetMode == reserved))
+    if ((types::enum_cast<EChannelActionType>(accessSetMode) == doNotSet) ||
+        (types::enum_cast<EChannelActionType>(accessSetMode) == reserved))
     {
-        log<level::DEBUG>("Get channel access - Invalid Access mode");
+        lg2::debug("Get channel access - Invalid Access mode");
         return responseInvalidFieldRequest();
     }
 
@@ -189,19 +207,20 @@ ipmi ::RspType<uint3_t, // access mode,
     if ((getChannelSessionSupport(chNum) == EChannelSessSupported::none) ||
         (!isValidChannel(chNum)))
     {
-        log<level::DEBUG>("Get channel access - No support on channel");
-        return response(ccActionNotSupportedForChannel);
+        lg2::debug("Get channel access - No support on channel: {CHANNEL}",
+                   "CHANNEL", chNum);
+        return responseActionNotSupportedForChannel();
     }
 
-    ChannelAccess chAccess;
+    ChannelAccess chAccess = {};
 
-    Cc compCode;
+    Cc compCode = ipmi::ccUnspecifiedError;
 
-    if (accessSetMode == nvData)
+    if (types::enum_cast<EChannelActionType>(accessSetMode) == nvData)
     {
         compCode = getChannelAccessPersistData(chNum, chAccess);
     }
-    else if (accessSetMode == activeData)
+    else if (types::enum_cast<EChannelActionType>(accessSetMode) == activeData)
     {
         compCode = getChannelAccessData(chNum, chAccess);
     }
@@ -215,9 +234,10 @@ ipmi ::RspType<uint3_t, // access mode,
     constexpr uint4_t reservedOut2 = 0;
 
     return responseSuccess(
-        static_cast<uint3_t>(chAccess.accessMode), chAccess.userAuthDisabled,
-        chAccess.perMsgAuthDisabled, chAccess.alertingDisabled, reservedOut1,
-        static_cast<uint4_t>(chAccess.privLimit), reservedOut2);
+        types::enum_cast<uint3_t>(chAccess.accessMode),
+        chAccess.userAuthDisabled, chAccess.perMsgAuthDisabled,
+        chAccess.alertingDisabled, reservedOut1,
+        types::enum_cast<uint4_t>(chAccess.privLimit), reservedOut2);
 }
 
 /** @brief implements the get channel info command
@@ -249,7 +269,7 @@ RspType<uint4_t,  // chNum
 {
     if (reserved)
     {
-        log<level::DEBUG>("Get channel access - Invalid field in request");
+        lg2::debug("Get channel info - Invalid field in request");
         return responseInvalidFieldRequest();
     }
 
@@ -257,7 +277,8 @@ RspType<uint4_t,  // chNum
         convertCurrentChannelNum(static_cast<uint8_t>(channel), ctx->channel);
     if (!isValidChannel(chNum))
     {
-        log<level::DEBUG>("Get channel Info - No support on channel");
+        lg2::debug("Get channel Info - No support on channel: {CHANNEL}",
+                   "CHANNEL", chNum);
         return responseInvalidFieldRequest();
     }
 
@@ -265,9 +286,9 @@ RspType<uint4_t,  // chNum
     Cc compCode = getChannelInfo(chNum, chInfo);
     if (compCode != ccSuccess)
     {
-        log<level::ERR>("Failed to get channel info",
-                        entry("CHANNEL=%x", chNum),
-                        entry("ERRNO=%x", compCode));
+        lg2::error("Failed to get channel info, channel: {CHANNEL}, "
+                   "errno: {ERRNO}",
+                   "CHANNEL", chNum, "ERRNO", compCode);
         return response(compCode);
     }
 
@@ -326,15 +347,15 @@ RspType<uint16_t, // stdPayloadType
 
     if (!doesDeviceExist(chNum) || !isValidChannel(chNum) || reserved)
     {
-        log<level::DEBUG>("Get channel payload - Invalid field in request");
+        lg2::debug("Get channel payload - Invalid field in request");
         return responseInvalidFieldRequest();
     }
 
     // Session support is available in active LAN channels.
     if (getChannelSessionSupport(chNum) == EChannelSessSupported::none)
     {
-        log<level::DEBUG>("Get channel payload - No support on channel");
-        return response(ccActionNotSupportedForChannel);
+        lg2::debug("Get channel payload - No support on channel");
+        return responseActionNotSupportedForChannel();
     }
     constexpr uint16_t stdPayloadType = standardPayloadBit(PayloadType::IPMI) |
                                         standardPayloadBit(PayloadType::SOL);
@@ -370,25 +391,21 @@ RspType<uint8_t> // formatVersion
 
     if (reserved || !isValidChannel(channel))
     {
-        log<level::DEBUG>(
-            "Get channel payload version - Invalid field in request");
+        lg2::debug("Get channel payload version - Invalid field in request");
         return responseInvalidFieldRequest();
     }
 
     if (getChannelSessionSupport(channel) == EChannelSessSupported::none)
     {
-        log<level::DEBUG>(
-            "Get channel payload version - No support on channel");
-        return response(ccActionNotSupportedForChannel);
+        lg2::debug("Get channel payload version - No support on channel");
+        return responsePayloadTypeNotSupported();
     }
 
     if (!isValidPayloadType(static_cast<PayloadType>(payloadTypeNum)))
     {
-        log<level::ERR>(
-            "Get channel payload version - Payload type unavailable");
+        lg2::error("Get channel payload version - Payload type unavailable");
 
-        constexpr uint8_t payloadTypeNotSupported = 0x80;
-        return response(payloadTypeNotSupported);
+        return responsePayloadTypeNotSupported();
     }
 
     // BCD encoded version representation - 1.0

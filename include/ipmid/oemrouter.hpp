@@ -2,11 +2,12 @@
 
 #include <ipmid/api.h>
 
+#include <ipmid/iana.hpp>
+
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
-#include <ipmid/iana.hpp>
 #include <vector>
 
 namespace oem
@@ -29,15 +30,13 @@ using Handler = std::function<ipmi_ret_t(ipmi_cmd_t,          // cmd byte
 class Router
 {
   public:
-    virtual ~Router()
-    {
-    }
+    virtual ~Router() {}
 
     /// Enable message routing to begin.
     virtual void activate() = 0;
 
     /// Register a handler for given OEMNumber & cmd.
-    /// Use IPMI_CMD_WILDCARD to catch any unregistered cmd
+    /// Use cmdWildcard to catch any unregistered cmd
     /// for the given OEMNumber.
     ///
     /// @param[in] oen - the OEM Number.
@@ -71,7 +70,7 @@ constexpr Number toOemNumber(const Group& oeg)
     return (oeg[2] << 16) | (oeg[1] << 8) | oeg[0];
 }
 
-/// Given an OEN, conver to the OEM Group.
+/// Given an OEN, convert to the OEM Group.
 ///
 /// @param[in] oen - the OEM Number.
 /// @return the OEM Group.
